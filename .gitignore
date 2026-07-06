@@ -1,0 +1,7 @@
+.DS_Store
+.trae/
+inspection_history/
+scripts/*.txt
+*.log
+*.tmp
+*.bak
