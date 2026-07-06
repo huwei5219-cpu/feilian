@@ -128,16 +128,6 @@ string_display_width() {
     fi
 }
 
-redact_sensitive_text() {
-    sed -E \
-        -e 's/("access_key_id"[[:space:]]*:[[:space:]]*")[^"]*"/\1***REDACTED***"/g' \
-        -e 's/("access_key_secret"[[:space:]]*:[[:space:]]*")[^"]*"/\1***REDACTED***"/g' \
-        -e 's/("access_token"[[:space:]]*:[[:space:]]*")[^"]*"/\1***REDACTED***"/g' \
-        -e 's/(Authorization:[[:space:]]*Bearer[[:space:]]+)[^[:space:]]+/\1***REDACTED***/Ig' \
-        -e 's/(access_key_secret[^[:space:]]*)[[:space:]]+[^[:space:]]+/\1 ***REDACTED***/Ig' \
-        -e 's/(app_secret[^[:space:]]*)[[:space:]]+[^[:space:]]+/\1 ***REDACTED***/Ig'
-}
-
 print_check() {
     local check_name="$1"
     local cmd="$2"
@@ -148,8 +138,6 @@ print_check() {
     local precomputed_output="${7:-}" # 可选：复用脚本内部已采集的输出，避免命令重复执行
     local output
     local exit_code
-    local display_cmd
-    local display_output
     
     TOTAL_CHECKS=$((TOTAL_CHECKS + 1)) || true
 
@@ -164,8 +152,6 @@ print_check() {
     if [[ -n "$forced_exit_code" ]]; then
         exit_code="$forced_exit_code"
     fi
-    display_cmd=$(printf '%s' "$cmd" | redact_sensitive_text)
-    display_output=$(printf '%s' "$output" | redact_sensitive_text)
     if [[ $exit_code -eq 0 ]]; then
         PASSED_CHECKS=$((PASSED_CHECKS + 1)) || true
     elif [[ $exit_code -eq 2 ]]; then
@@ -202,12 +188,12 @@ print_check() {
             echo -e "${WHITE}【检查要求】${NC}: ${requirement}"
         fi
 
-        printf "%b%s%b\n" "${WHITE}【使用命令】${NC}: ${CYAN}" "$display_cmd" "$NC"
+        printf "%b%s%b\n" "${WHITE}【使用命令】${NC}: ${CYAN}" "$cmd" "$NC"
 
         echo -e "${WHITE}【回显结果】${NC}:"
         while IFS= read -r line; do
             echo -e "     | ${CYAN}${line}${NC}"
-        done <<< "$display_output"
+        done <<< "$output"
 
         # 状态显示：✅通过 / ❌不通过 + 判断原因
         if [[ $exit_code -eq 0 ]]; then
@@ -1620,81 +1606,557 @@ get_default_route_field() {
         }'
 }
 
-find_available_ip_rule_pref() {
-    local pref="${1:-100}"
-    while ip rule show 2>/dev/null | awk -v pref="$pref" '$1 == pref ":" {found=1} END {exit found ? 0 : 1}'; do
-        pref=$((pref + 1))
-    done
-    echo "$pref"
+get_static_default_route_rules_file() {
+    echo "/etc/feilian-default-egress-static-routes.rules"
 }
 
-show_default_ingress_route_optimizer_detail() {
-    local default_line default_dev default_gw existing_rule pref
-    local persist_script="/usr/local/sbin/feilian-default-ingress-main-route.sh"
-    local persist_service="/etc/systemd/system/feilian-default-ingress-main-route.service"
+get_static_default_route_script_file() {
+    echo "/usr/local/sbin/feilian-default-egress-static-routes.sh"
+}
+
+get_static_default_route_service_file() {
+    echo "/etc/systemd/system/feilian-default-egress-static-routes.service"
+}
+
+get_legacy_default_ingress_script_file() {
+    echo "/usr/local/sbin/feilian-default-ingress-main-route.sh"
+}
+
+get_legacy_default_ingress_service_file() {
+    echo "/etc/systemd/system/feilian-default-ingress-main-route.service"
+}
+
+extract_host_from_target() {
+    local target="${1:-}"
+    target="${target#*://}"
+    target="${target%%/*}"
+    if [[ "$target" == \[*\] ]]; then
+        target="${target#\[}"
+        target="${target%\]}"
+    fi
+    if [[ "$target" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]+$ ]]; then
+        target="${target%:*}"
+    elif [[ "$target" != *:*:* && "$target" == *:* ]]; then
+        target="${target%:*}"
+    fi
+    printf '%s\n' "$target"
+}
+
+resolve_host_ipv4s() {
+    local host="${1:-}"
+    [[ -n "$host" ]] || return 0
+    if validate_ipv4 "$host"; then
+        printf '%s\n' "$host"
+        return 0
+    fi
+
+    {
+        if command -v getent >/dev/null 2>&1; then
+            getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}'
+        fi
+        if command -v dig >/dev/null 2>&1; then
+            dig +short A "$host" 2>/dev/null
+        elif command -v nslookup >/dev/null 2>&1; then
+            nslookup "$host" 2>/dev/null | awk '/^Address: / {print $2}'
+        fi
+    } | awk '/^([0-9]{1,3}\.){3}[0-9]{1,3}$/' | sort -u
+}
+
+collect_legacy_default_egress_route_targets() {
+    local platform_url platform_host
+    local mgmt_grpc_endpoint mgmt_grpc_host
+    local center_dns_grpc_endpoint center_dns_grpc_host
+    local center_dns_ip master_pop slave_pop
+    local ip
+
+    platform_url=$(sed -n 's/^url: //p' /opt/feilian/cpe/conf/config.yaml 2>/dev/null)
+    platform_host=$(extract_host_from_target "$platform_url")
+    for ip in $(resolve_host_ipv4s "$platform_host"); do
+        printf '%s\n' "$ip/32"
+    done
+
+    mgmt_grpc_endpoint=$(awk -F "'" '/option ops_controller_grpc_addr/ {print $2; exit}' /opt/feilian/cpe/.cache/ucistore 2>/dev/null)
+    mgmt_grpc_host=$(extract_host_from_target "$mgmt_grpc_endpoint")
+    for ip in $(resolve_host_ipv4s "$mgmt_grpc_host"); do
+        printf '%s\n' "$ip/32"
+    done
+
+    center_dns_grpc_endpoint=$(awk -F "'" '/option dns_controller_grpc_addr/ {print $2; exit}' /opt/feilian/cpe/.cache/ucistore 2>/dev/null)
+    center_dns_grpc_host=$(extract_host_from_target "$center_dns_grpc_endpoint")
+    for ip in $(resolve_host_ipv4s "$center_dns_grpc_host"); do
+        printf '%s\n' "$ip/32"
+    done
+
+    center_dns_ip=$(awk -F '=' '/add-dns-server-ip/ {print $2; exit}' /etc/dnsmasq.d/cpe.conf 2>/dev/null)
+    if validate_ipv4 "$center_dns_ip"; then
+        printf '%s\n' "$center_dns_ip/32"
+    fi
+
+    master_pop=$(awk '/Endpoint = / {print $3}' /opt/feilian/cpe/conf/tun0_master.conf 2>/dev/null | awk -F : '{print $1}' | head -n 1)
+    for ip in $(resolve_host_ipv4s "$master_pop"); do
+        printf '%s\n' "$ip/32"
+    done
+
+    slave_pop=$(awk '/Endpoint = / {print $3}' /opt/feilian/cpe/conf/tun0_slave.conf 2>/dev/null | awk -F : '{print $1}' | head -n 1)
+    for ip in $(resolve_host_ipv4s "$slave_pop"); do
+        printf '%s\n' "$ip/32"
+    done
+}
+
+list_legacy_default_ingress_main_rules() {
+    ip rule show 2>/dev/null | awk '/iif [^[:space:]]+[[:space:]].* lookup main/ {print}'
+}
+
+remove_legacy_default_ingress_main_rules() {
+    while read -r pref; do
+        [[ -n "$pref" ]] || continue
+        ip rule del pref "$pref" 2>/dev/null || true
+    done < <(
+        list_legacy_default_ingress_main_rules \
+            | awk -F: '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1); if ($1 ~ /^[0-9]+$/) print $1}' \
+            | sort -rn
+    )
+}
+
+remove_static_default_route_destinations_from_main() {
+    local destinations_csv="${1:-}"
+    local old_ifs="$IFS"
+    local destination
+
+    [[ -n "$destinations_csv" ]] || return 0
+
+    IFS=','
+    read -r -a STATIC_ROUTE_DEST_ITEMS <<< "$destinations_csv"
+    IFS="$old_ifs"
+
+    for destination in "${STATIC_ROUTE_DEST_ITEMS[@]}"; do
+        [[ -n "$destination" ]] || continue
+        ip route del "$destination" 2>/dev/null || true
+    done
+}
+
+apply_static_default_route_destinations_to_main() {
+    local destinations_csv="$1"
+    local default_dev="$2"
+    local default_gw="$3"
+    local old_ifs="$IFS"
+    local destination
+
+    [[ -n "$destinations_csv" ]] || return 0
+    [[ -n "$default_dev" ]] || return 1
+
+    IFS=','
+    read -r -a STATIC_ROUTE_DEST_ITEMS <<< "$destinations_csv"
+    IFS="$old_ifs"
+
+    for destination in "${STATIC_ROUTE_DEST_ITEMS[@]}"; do
+        [[ -n "$destination" ]] || continue
+        if [[ -n "$default_gw" ]]; then
+            ip route replace "$destination" via "$default_gw" dev "$default_dev" || return 1
+        else
+            ip route replace "$destination" dev "$default_dev" || return 1
+        fi
+    done
+}
+
+get_static_default_route_destinations_csv() {
+    local rules_file
+    rules_file=$(get_static_default_route_rules_file)
+    [[ -s "$rules_file" ]] || return 0
+    awk 'NF >= 1 && $1 !~ /^#/ {print $1}' "$rules_file" | paste -sd, -
+}
+
+write_static_default_route_rules_from_csv() {
+    local destinations_csv="${1:-}"
+    local rules_file
+    local old_ifs="$IFS"
+    local destination
+
+    rules_file=$(get_static_default_route_rules_file)
+    if [[ -z "$destinations_csv" ]]; then
+        rm -f "$rules_file"
+        return 0
+    fi
+
+    : > "$rules_file"
+    IFS=','
+    read -r -a STATIC_ROUTE_DEST_ITEMS <<< "$destinations_csv"
+    IFS="$old_ifs"
+    for destination in "${STATIC_ROUTE_DEST_ITEMS[@]}"; do
+        [[ -n "$destination" ]] || continue
+        printf '%s\n' "$destination" >> "$rules_file"
+    done
+}
+
+validate_static_route_destination() {
+    local raw ip prefix
+    raw=$(normalize_ipv4_input "${1:-}")
+    if validate_ipv4 "$raw"; then
+        is_safe_static_route_destination "$raw" 32 || return 1
+        return 0
+    fi
+    if [[ "$raw" =~ ^([^/]+)/([0-9]{1,2})$ ]]; then
+        ip=$(normalize_ipv4_input "${BASH_REMATCH[1]}")
+        prefix="${BASH_REMATCH[2]}"
+        validate_ipv4 "$ip" || return 1
+        [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
+        [[ "$prefix" -ge 0 && "$prefix" -le 32 ]]
+        is_safe_static_route_destination "$ip" "$prefix" || return 1
+        return $?
+    fi
+    return 1
+}
+
+is_safe_static_route_destination() {
+    local ip="$1"
+    local prefix="$2"
+    local first_octet
+
+    [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
+    # 0.0.0.0/0 等价于改默认路由，不属于“指定目的地址”场景。
+    [[ "$prefix" -ge 1 && "$prefix" -le 32 ]] || return 1
+    first_octet="${ip%%.*}"
+    [[ "$first_octet" =~ ^[0-9]+$ ]] || return 1
+    [[ "$first_octet" -ne 0 ]] || return 1
+    [[ "$first_octet" -ne 127 ]] || return 1
+    [[ "$first_octet" -lt 224 ]] || return 1
+    [[ "$ip" != "255.255.255.255" ]] || return 1
+    return 0
+}
+
+normalize_static_route_destination() {
+    local raw ip prefix
+    raw=$(normalize_ipv4_input "${1:-}")
+    if validate_ipv4 "$raw"; then
+        is_safe_static_route_destination "$raw" 32 || return 1
+        printf '%s/32\n' "$raw"
+        return 0
+    fi
+    if [[ "$raw" =~ ^([^/]+)/([0-9]{1,2})$ ]]; then
+        ip=$(normalize_ipv4_input "${BASH_REMATCH[1]}")
+        prefix="${BASH_REMATCH[2]}"
+        validate_ipv4 "$ip" || return 1
+        [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
+        [[ "$prefix" -ge 0 && "$prefix" -le 32 ]] || return 1
+        is_safe_static_route_destination "$ip" "$prefix" || return 1
+        printf '%s/%s\n' "$ip" "$prefix"
+        return 0
+    fi
+    return 1
+}
+
+normalize_static_route_destinations() {
+    local raw="$1"
+    local item destination
+    local normalized=""
+    local seen=""
+
+    raw=${raw//，/,}
+    raw=${raw// /}
+    IFS=',' read -r -a STATIC_ROUTE_INPUT_ITEMS <<< "$raw"
+    for item in "${STATIC_ROUTE_INPUT_ITEMS[@]}"; do
+        [[ -n "$item" ]] || continue
+        destination=$(normalize_static_route_destination "$item") || return 1
+        case ",${seen}," in
+            *,"${destination}",*) continue ;;
+        esac
+        seen+="${seen:+,}${destination}"
+        normalized+="${normalized:+,}${destination}"
+    done
+    [[ -n "$normalized" ]] || return 1
+    printf '%s\n' "$normalized"
+}
+
+normalize_existing_static_route_destinations() {
+    local raw="$1"
+    local existing_csv item destination
+    local normalized=""
+    local seen=""
+
+    existing_csv=$(get_static_default_route_destinations_csv)
+    [[ -n "$existing_csv" ]] || return 2
+
+    raw=${raw//，/,}
+    raw=${raw// /}
+    IFS=',' read -r -a STATIC_ROUTE_INPUT_ITEMS <<< "$raw"
+    for item in "${STATIC_ROUTE_INPUT_ITEMS[@]}"; do
+        [[ -n "$item" ]] || continue
+        destination=$(normalize_static_route_destination "$item") || return 1
+        case ",${existing_csv}," in
+            *,"${destination}",*) ;;
+            *) return 2 ;;
+        esac
+        case ",${seen}," in
+            *,"${destination}",*) continue ;;
+        esac
+        seen+="${seen:+,}${destination}"
+        normalized+="${normalized:+,}${destination}"
+    done
+    [[ -n "$normalized" ]] || return 1
+    printf '%s\n' "$normalized"
+}
+
+merge_static_route_destinations_csv() {
+    local existing_csv="${1:-}"
+    local added_csv="${2:-}"
+    local merged="${existing_csv}"
+    local old_ifs="$IFS"
+    local destination
+
+    [[ -n "$added_csv" ]] || {
+        printf '%s\n' "$existing_csv"
+        return 0
+    }
+
+    IFS=','
+    read -r -a STATIC_ROUTE_DEST_ITEMS <<< "$added_csv"
+    IFS="$old_ifs"
+    for destination in "${STATIC_ROUTE_DEST_ITEMS[@]}"; do
+        [[ -n "$destination" ]] || continue
+        case ",${merged}," in
+            *,"${destination}",*) ;;
+            *) merged+="${merged:+,}${destination}" ;;
+        esac
+    done
+    printf '%s\n' "$merged"
+}
+
+subtract_static_route_destinations_csv() {
+    local existing_csv="${1:-}"
+    local removed_csv="${2:-}"
+    local result=""
+    local old_ifs="$IFS"
+    local destination
+
+    [[ -n "$existing_csv" ]] || return 0
+    IFS=','
+    read -r -a STATIC_ROUTE_DEST_ITEMS <<< "$existing_csv"
+    IFS="$old_ifs"
+    for destination in "${STATIC_ROUTE_DEST_ITEMS[@]}"; do
+        [[ -n "$destination" ]] || continue
+        case ",${removed_csv}," in
+            *,"${destination}",*) ;;
+            *) result+="${result:+,}${destination}" ;;
+        esac
+    done
+    printf '%s\n' "$result"
+}
+
+validate_static_route_destinations_not_exist() {
+    local destinations_csv="${1:-}"
+    local existing_csv destination
+    local old_ifs="$IFS"
+
+    existing_csv=$(get_static_default_route_destinations_csv)
+    [[ -n "$destinations_csv" ]] || return 0
+    IFS=','
+    read -r -a STATIC_ROUTE_DEST_ITEMS <<< "$destinations_csv"
+    IFS="$old_ifs"
+    for destination in "${STATIC_ROUTE_DEST_ITEMS[@]}"; do
+        [[ -n "$destination" ]] || continue
+        case ",${existing_csv}," in
+            *,"${destination}",*)
+                echo "静态路由 ${destination} 已存在"
+                return 1
+                ;;
+        esac
+    done
+    return 0
+}
+
+format_static_route_destinations_for_display() {
+    local destinations_csv="${1:-}"
+    local old_ifs="$IFS"
+    local destination
+    if [[ -z "$destinations_csv" ]]; then
+        echo "  未发现已配置的静态路由"
+        return 0
+    fi
+    IFS=','
+    read -r -a STATIC_ROUTE_DEST_ITEMS <<< "$destinations_csv"
+    IFS="$old_ifs"
+    for destination in "${STATIC_ROUTE_DEST_ITEMS[@]}"; do
+        [[ -n "$destination" ]] || continue
+        echo "  - ${destination}"
+    done
+}
+
+find_static_default_route_in_table() {
+    local table="${1:-main}"
+    local destination="$2"
+    local route_cmd=(ip route show)
+    if [[ -n "$table" && "$table" != "main" ]]; then
+        route_cmd+=(table "$table")
+    fi
+    "${route_cmd[@]}" 2>/dev/null | awk -v destination="$destination" '
+        BEGIN {
+            host_destination = destination
+            sub(/\/32$/, "", host_destination)
+        }
+        $1 == destination || $1 == host_destination {print; exit}'
+}
+
+format_static_default_route_runtime_status() {
+    local destinations_csv="${1:-}"
+    local old_ifs="$IFS"
+    local destination route_line
+
+    if [[ -z "$destinations_csv" ]]; then
+        echo "  未发现运行态静态路由"
+        return 0
+    fi
+
+    IFS=','
+    read -r -a STATIC_ROUTE_DEST_ITEMS <<< "$destinations_csv"
+    IFS="$old_ifs"
+    for destination in "${STATIC_ROUTE_DEST_ITEMS[@]}"; do
+        [[ -n "$destination" ]] || continue
+        route_line=$(find_static_default_route_in_table "main" "$destination")
+        if [[ -n "$route_line" ]]; then
+            echo "  ${destination} -> ${route_line}"
+        else
+            echo "  ${destination} -> 未下发"
+        fi
+    done
+}
+
+show_static_default_route_status() {
+    local rules_file script_file service_file
+    local default_line default_dev default_gw destinations_csv
+    local svc_state
+
+    rules_file=$(get_static_default_route_rules_file)
+    script_file=$(get_static_default_route_script_file)
+    service_file=$(get_static_default_route_service_file)
+    default_line=$(get_default_route_field line)
+    default_dev=$(get_default_route_field dev)
+    default_gw=$(get_default_route_field via)
+    destinations_csv=$(get_static_default_route_destinations_csv)
+
+    echo "【当前配置】:"
+    format_static_route_destinations_for_display "$destinations_csv"
+    echo ""
+    echo "【默认出口识别】:"
+    echo "  - 默认路由: ${default_line:-未获取}"
+    echo "  - 默认路由口: ${default_dev:-未获取}"
+    echo "  - 默认网关: ${default_gw:-未获取}"
+    echo "  - 生效路由表: main"
+    echo ""
+    echo "【main表静态路由详情】:"
+    format_static_default_route_runtime_status "$destinations_csv"
+    echo ""
+    echo "【配置文件状态】:"
+    echo "  - 规则文件: ${rules_file} $([[ -s "$rules_file" ]] && echo "存在" || echo "不存在/为空")"
+    echo "  - 持久化脚本: ${script_file} $([[ -f "$script_file" ]] && echo "存在" || echo "不存在")"
+    echo "  - systemd服务: ${service_file} $([[ -f "$service_file" ]] && echo "存在" || echo "不存在")"
+    echo ""
+    echo "【服务状态】:"
+    svc_state=$(systemctl is-enabled feilian-default-egress-static-routes.service 2>/dev/null || true)
+    echo "  - static-route enabled: ${svc_state:-未启用}"
+    svc_state=$(systemctl is-active feilian-default-egress-static-routes.service 2>/dev/null || true)
+    echo "  - static-route active: ${svc_state:-未运行}"
+}
+
+show_static_default_route_add_detail() {
+    local destinations_csv="$1"
+    local default_line default_dev default_gw
+    local rules_file script_file service_file
 
     default_line=$(get_default_route_field line)
     default_dev=$(get_default_route_field dev)
     default_gw=$(get_default_route_field via)
-    existing_rule=""
-    pref=""
-    if [[ -n "$default_dev" ]]; then
-        existing_rule=$(ip rule show 2>/dev/null | grep -E "iif ${default_dev}[[:space:]].* lookup main" | head -n 1 || true)
-        pref=$(find_available_ip_rule_pref 100)
-    fi
+    rules_file=$(get_static_default_route_rules_file)
+    script_file=$(get_static_default_route_script_file)
+    service_file=$(get_static_default_route_service_file)
 
     cat <<EOF
 ------------------------------------------------------------
-优化脚本 3: 默认路由入口流量强制从默认路由口出
+优化脚本 3: 静态路由默认出接口管理
 ------------------------------------------------------------
 【适用场景】:
-  - CPE 默认路由口既承载普通外网出口，又存在飞连隧道策略路由。
-  - 从默认路由口进入的回程/转发流量被策略路由吸入 tun0_master/tun0_slave。
-  - 需要确保从默认路由口进来的流量，优先按 main 表默认路由从默认路由口出去。
+  - 需要把指定目的IP/网段固定从默认路由口出去。
+  - 仅对手工指定的静态路由生效，不再自动固化管理平台、GRPC、中心DNS、POP等地址。
 
-【当前识别】:
+【当前默认出口】:
   - 默认路由: ${default_line:-未获取}
   - 默认路由口: ${default_dev:-未获取}
   - 默认网关: ${default_gw:-未获取}
-  - 已有规则: ${existing_rule:-未发现}
+  - 生效路由表: main
+
+【将追加的静态路由】:
+$(format_static_route_destinations_for_display "$destinations_csv")
 
 【将执行的动作】:
-  1. 检查默认路由口和默认网关。
-  2. 如不存在同类规则，新增策略路由:
-     ip rule add pref ${pref:-自动} iif ${default_dev:-<默认路由口>} lookup main
-  3. 执行 ip route flush cache。
-  4. 写入持久化恢复脚本:
-     ${persist_script}
-  5. 写入并启用 systemd 开机恢复服务:
-     ${persist_service}
-  6. 展示 ip rule、默认路由和服务状态，便于确认。
-
-【说明】:
-  - iif ${default_dev:-<默认路由口>} lookup main 表示: 从默认路由口进入的流量优先查 main 路由表。
-  - main 表中默认路由通常为: default via ${default_gw:-<默认网关>} dev ${default_dev:-<默认路由口>}。
-  - systemd 服务会在 network-online 后自动重新识别非隧道默认路由口并补回规则，避免重启后配置丢失。
+  1. 在 main 表中为上述目的地址写入静态路由，出口与默认路由一致。
+  2. 本地访问这些目的地址时优先按默认路由口出去，不走 tun。
+  3. 写入规则文件: ${rules_file}
+  4. 写入持久化脚本: ${script_file}
+  5. 写入并启用 systemd 服务: ${service_file}
+  6. 重启后自动恢复静态路由，避免配置丢失。
 EOF
 }
 
-write_default_ingress_route_persistence() {
-    local pref="$1"
-    local persist_script="/usr/local/sbin/feilian-default-ingress-main-route.sh"
-    local persist_service="/etc/systemd/system/feilian-default-ingress-main-route.service"
+show_static_default_route_delete_detail() {
+    local destinations_csv="$1"
+    local delete_scope="$2"
+    local rules_file script_file service_file
 
-    cat > "$persist_script" <<EOF
+    rules_file=$(get_static_default_route_rules_file)
+    script_file=$(get_static_default_route_script_file)
+    service_file=$(get_static_default_route_service_file)
+
+    cat <<EOF
+------------------------------------------------------------
+优化脚本 3: 静态路由默认出接口管理
+------------------------------------------------------------
+【将删除的静态路由】:
+$(if [[ "$delete_scope" == "ALL" ]]; then echo "  - 全部静态路由"; else format_static_route_destinations_for_display "$destinations_csv"; fi)
+
+【将执行的动作】:
+  1. 删除对应的运行态静态路由。
+  2. 更新规则文件: ${rules_file}
+  3. 如已无静态路由，则删除持久化脚本和 systemd 服务:
+     ${script_file}
+     ${service_file}
+EOF
+}
+
+write_static_default_route_persistence_from_rules() {
+    local rules_file script_file service_file
+    rules_file=$(get_static_default_route_rules_file)
+    script_file=$(get_static_default_route_script_file)
+    service_file=$(get_static_default_route_service_file)
+
+    cat > "$script_file" <<EOF
 #!/bin/sh
 set -eu
 
-PREF="${pref}"
+RULES_FILE="${rules_file}"
+OLD_SERVICE="$(get_legacy_default_ingress_service_file)"
+OLD_SCRIPT="$(get_legacy_default_ingress_script_file)"
 
 DEFAULT_DEV=\$(ip -o route show default 2>/dev/null | awk '
     {
-        dev = ""
+        dev = ""; via = ""
         for (i = 1; i <= NF; i++) {
             if (\$i == "dev" && (i + 1) <= NF) dev = \$(i + 1)
+            if (\$i == "via" && (i + 1) <= NF) via = \$(i + 1)
         }
         if (dev != "" && dev !~ /^(tun|docker|br-|veth|virbr|flannel|cni|wg)/) {
             print dev
+            exit
+        }
+    }')
+
+DEFAULT_GW=\$(ip -o route show default 2>/dev/null | awk '
+    {
+        dev = ""; via = ""
+        for (i = 1; i <= NF; i++) {
+            if (\$i == "dev" && (i + 1) <= NF) dev = \$(i + 1)
+            if (\$i == "via" && (i + 1) <= NF) via = \$(i + 1)
+        }
+        if (dev != "" && dev !~ /^(tun|docker|br-|veth|virbr|flannel|cni|wg)/) {
+            print via
             exit
         }
     }')
@@ -1704,26 +2166,49 @@ if [ -z "\$DEFAULT_DEV" ]; then
     exit 0
 fi
 
-if ip rule show | grep -Eq "iif \${DEFAULT_DEV}[[:space:]].* lookup main"; then
-    echo "规则已存在: iif \${DEFAULT_DEV} lookup main"
-else
-    ip rule add pref "\$PREF" iif "\$DEFAULT_DEV" lookup main
-    echo "已添加规则: pref \${PREF} iif \${DEFAULT_DEV} lookup main"
+ip rule show 2>/dev/null \
+    | awk '/iif [^[:space:]]+[[:space:]].* lookup main/ {sub(/:$/, "", \$1); if (\$1 ~ /^[0-9]+$/) print \$1}' \
+    | sort -rn \
+    | while read -r pref; do
+        [ -n "\$pref" ] || continue
+        ip rule del pref "\$pref" 2>/dev/null || true
+    done
+
+if [ -f "\$OLD_SERVICE" ]; then
+    systemctl disable --now \"\$(basename \"\$OLD_SERVICE\")\" 2>/dev/null || true
+    rm -f "\$OLD_SERVICE"
 fi
+rm -f "\$OLD_SCRIPT"
+systemctl daemon-reload 2>/dev/null || true
+
+if [ ! -s "\$RULES_FILE" ]; then
+    echo "无静态路由配置，跳过"
+    exit 0
+fi
+
+while read -r destination; do
+    [ -n "\$destination" ] || continue
+    case "\$destination" in \#*) continue ;; esac
+    if [ -n "\$DEFAULT_GW" ]; then
+        ip route replace "\$destination" via "\$DEFAULT_GW" dev "\$DEFAULT_DEV"
+    else
+        ip route replace "\$destination" dev "\$DEFAULT_DEV"
+    fi
+done < "\$RULES_FILE"
 
 ip route flush cache 2>/dev/null || true
 EOF
-    chmod +x "$persist_script"
+    chmod +x "$script_file"
 
-    cat > "$persist_service" <<EOF
+    cat > "$service_file" <<EOF
 [Unit]
-Description=Feilian CPE keep default ingress traffic on main route table
+Description=Feilian CPE static routes via default WAN
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=${persist_script}
+ExecStart=${script_file}
 RemainAfterExit=yes
 
 [Install]
@@ -1731,78 +2216,282 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable --now "$(basename "$persist_service")"
+    systemctl enable feilian-default-egress-static-routes.service >/dev/null 2>&1 || return 1
+    systemctl restart feilian-default-egress-static-routes.service || {
+        systemctl --no-pager --full status feilian-default-egress-static-routes.service 2>/dev/null | tail -80 || true
+        return 1
+    }
 }
 
-run_default_ingress_route_optimizer() {
-    show_default_ingress_route_optimizer_detail
-    echo ""
-    if ! confirm_y_or_cancel "输入 y/Y 确认执行，直接回车保持当前确认项，输入其他任意内容取消: "; then
-        echo -e "${YELLOW}已取消执行。${NC}"
-        return 0
-    fi
+cleanup_legacy_default_ingress_artifacts() {
+    local legacy_script legacy_service
+    legacy_script=$(get_legacy_default_ingress_script_file)
+    legacy_service=$(get_legacy_default_ingress_service_file)
 
-    if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
-        echo -e "${RED}执行失败: 该优化脚本需要 root 权限，请先 sudo -s 后重新执行。${NC}"
-        return 1
-    fi
+    remove_legacy_default_ingress_main_rules
+    systemctl disable --now feilian-default-ingress-main-route.service 2>/dev/null || true
+    rm -f "$legacy_service"
+    rm -f "$legacy_script"
+    systemctl daemon-reload 2>/dev/null || true
+}
 
-    local default_line default_dev default_gw existing_rule pref persist_rule
-    default_line=$(get_default_route_field line)
+sync_static_default_route_runtime() {
+    local old_destinations_csv="${1:-}"
+    local new_destinations_csv="${2:-}"
+    local default_dev="$3"
+    local default_gw="$4"
+    cleanup_legacy_default_ingress_artifacts
+    remove_static_default_route_destinations_from_main "$old_destinations_csv"
+    apply_static_default_route_destinations_to_main "$new_destinations_csv" "$default_dev" "$default_gw" || return 1
+    ip route flush cache 2>/dev/null || true
+}
+
+remove_static_default_route_runtime_and_persistence() {
+    local old_destinations_csv="${1:-}"
+    local rules_file script_file service_file
+
+    rules_file=$(get_static_default_route_rules_file)
+    script_file=$(get_static_default_route_script_file)
+    service_file=$(get_static_default_route_service_file)
+
+    cleanup_legacy_default_ingress_artifacts
+    remove_static_default_route_destinations_from_main "$old_destinations_csv"
+    systemctl disable --now feilian-default-egress-static-routes.service 2>/dev/null || true
+    rm -f "$service_file"
+    rm -f "$script_file"
+    rm -f "$rules_file"
+    systemctl daemon-reload
+    ip route flush cache 2>/dev/null || true
+}
+
+apply_static_default_route_rules() {
+    local old_destinations_csv="${1:-}"
+    local new_destinations_csv
+    local default_dev default_gw destination route_line
+
     default_dev=$(get_default_route_field dev)
     default_gw=$(get_default_route_field via)
-    if [[ -z "$default_dev" ]]; then
-        echo -e "${RED}执行失败: 未识别到非隧道默认路由口。${NC}"
-        ip route show default 2>/dev/null || true
-        return 1
-    fi
-    if [[ -z "$default_gw" ]]; then
-        echo -e "${YELLOW}提示: 默认路由未显示 via 网关，将仍按 iif ${default_dev} lookup main 添加规则。${NC}"
-    fi
+    new_destinations_csv=$(get_static_default_route_destinations_csv)
 
-    existing_rule=$(ip rule show 2>/dev/null | grep -E "iif ${default_dev}[[:space:]].* lookup main" | head -n 1 || true)
-    echo -e "${CYAN}开始执行优化脚本: 默认路由入口流量强制从默认路由口出${NC}"
-    echo -e "${WHITE}1. 当前默认路由${NC}"
-    echo "   ${default_line:-未获取}"
-
-    if [[ -n "$existing_rule" ]]; then
-        echo -e "${WHITE}2. 已存在同类策略路由，跳过新增${NC}"
-        echo "   ${existing_rule}"
-        pref=$(printf '%s\n' "$existing_rule" | awk -F: '{gsub(/^[[:space:]]+|[[:space:]]+$/, "", $1); print $1; exit}')
-        [[ -n "$pref" && "$pref" =~ ^[0-9]+$ ]] || pref=$(find_available_ip_rule_pref 100)
-    else
-        pref=$(find_available_ip_rule_pref 100)
-        echo -e "${WHITE}2. 新增策略路由规则${NC}"
-        echo "   ip rule add pref ${pref} iif ${default_dev} lookup main"
-        ip rule add pref "$pref" iif "$default_dev" lookup main || {
-            echo -e "${RED}执行失败: ip rule add 失败${NC}"
-            return 1
-        }
-    fi
-
-    echo -e "${WHITE}3. 刷新路由缓存${NC}"
-    ip route flush cache 2>/dev/null || true
-
-    echo -e "${WHITE}4. 写入并启用开机持久化恢复服务${NC}"
-    write_default_ingress_route_persistence "$pref" || {
-        echo -e "${RED}执行失败: 写入或启用 systemd 持久化服务失败${NC}"
+    [[ -n "$default_dev" ]] || {
+        echo "未识别到非隧道默认路由口"
         return 1
     }
 
-    echo -e "${WHITE}5. 查看当前策略路由、默认路由和服务状态${NC}"
-    echo "--- ip rule ---"
-    ip rule show
-    echo "--- ip route default ---"
-    ip route show default
-    echo "--- systemd service ---"
-    systemctl --no-pager --full status feilian-default-ingress-main-route.service 2>/dev/null || true
-    persist_rule=$(ip rule show 2>/dev/null | grep -E "iif ${default_dev}[[:space:]].* lookup main" | head -n 1 || true)
-    if [[ -z "$persist_rule" ]]; then
-        echo -e "${RED}执行失败: 未检测到 iif ${default_dev} lookup main 策略路由。${NC}"
-        return 1
+    if [[ -z "$new_destinations_csv" ]]; then
+        remove_static_default_route_runtime_and_persistence "$old_destinations_csv"
+        echo -e "${YELLOW}当前已无静态路由配置，已清理运行态和持久化。${NC}"
+        return 0
     fi
 
-    echo -e "${GREEN}优化脚本执行完成。${NC}"
+    sync_static_default_route_runtime "$old_destinations_csv" "$new_destinations_csv" "$default_dev" "$default_gw" || return 1
+    write_static_default_route_persistence_from_rules || return 1
+
+    local old_ifs="$IFS"
+    IFS=','
+    read -r -a STATIC_ROUTE_DEST_ITEMS <<< "$new_destinations_csv"
+    IFS="$old_ifs"
+    for destination in "${STATIC_ROUTE_DEST_ITEMS[@]}"; do
+        [[ -n "$destination" ]] || continue
+        route_line=$(find_static_default_route_in_table "main" "$destination")
+        [[ -n "$route_line" ]] || {
+            echo "未检测到运行态静态路由: table=main destination=${destination}"
+            return 1
+        }
+    done
+    return 0
+}
+
+show_static_default_route_optimizer_detail() {
+    cat <<EOF
+------------------------------------------------------------
+优化脚本 3: 静态路由默认出接口管理
+------------------------------------------------------------
+【适用场景】:
+  - 需要将指定目的IP或网段固定从默认路由口出去。
+  - 本地访问这些目的地址时优先走默认路由，不走 tun。
+
+【能力说明】:
+  - 检查当前静态路由配置和 main 表运行态。
+  - 追加新的静态路由。
+  - 删除指定静态路由或全部静态路由。
+  - 写入 systemd 持久化，重启后自动恢复配置。
+EOF
+}
+
+run_default_ingress_route_optimizer() {
+    local action input destinations_csv old_destinations_csv new_destinations_csv delete_scope
+    local rules_file backup_file
+
+    rules_file=$(get_static_default_route_rules_file)
+    while true; do
+        echo ""
+        echo -e "${BOLD}${CYAN}------------------------------------------------------------${NC}"
+        echo -e "${BOLD}${WHITE} 静态路由默认出接口管理${NC}"
+        echo -e "${BOLD}${CYAN}------------------------------------------------------------${NC}"
+        show_static_default_route_status
+        echo ""
+        echo -e "${GREEN}  1. 检查现有配置${NC}"
+        echo -e "${GREEN}  2. 追加静态路由${NC}"
+        echo -e "${GREEN}  3. 删除静态路由${NC}"
+        echo -e "${WHITE}  0. 返回/退出${NC}"
+        printf "%b" "${BOLD}请选择操作 [0-3，直接回车保持当前菜单]: ${NC}"
+        read -r action || action=""
+        if [[ -z "$action" ]]; then
+            continue
+        fi
+
+        case "$action" in
+            1)
+                continue
+                ;;
+            2)
+                while true; do
+                    printf "%b" "${BOLD}请输入静态路由目标IP或网段，多个用逗号分隔: ${NC}"
+                    read -r input || input=""
+                    if [[ -z "$input" ]]; then
+                        echo -e "${YELLOW}未输入静态路由目标，请继续输入。${NC}"
+                        continue
+                    fi
+                    if destinations_csv=$(normalize_static_route_destinations "$input"); then
+                        break
+                    fi
+                    echo -e "${RED}静态路由格式无效，请输入 192.0.2.10 或 198.51.100.0/24 这种格式。${NC}"
+                done
+                if ! validate_static_route_destinations_not_exist "$destinations_csv"; then
+                    continue
+                fi
+                show_static_default_route_add_detail "$destinations_csv"
+                echo ""
+                if ! confirm_y_or_cancel "输入 y/Y 确认追加，直接回车保持当前确认项，输入其他任意内容取消: "; then
+                    echo -e "${YELLOW}已取消追加。${NC}"
+                    continue
+                fi
+                if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+                    echo -e "${RED}执行失败: 该功能需要 root 权限，请先 sudo -s 后重新执行。${NC}"
+                    continue
+                fi
+                old_destinations_csv=$(get_static_default_route_destinations_csv)
+                backup_file=$(mktemp)
+                [[ -f "$rules_file" ]] && cp "$rules_file" "$backup_file" || : > "$backup_file"
+                new_destinations_csv=$(merge_static_route_destinations_csv "$old_destinations_csv" "$destinations_csv")
+                write_static_default_route_rules_from_csv "$new_destinations_csv"
+                if ! apply_static_default_route_rules "$old_destinations_csv"; then
+                    echo -e "${YELLOW}正在回滚到应用前的静态路由配置...${NC}"
+                    if [[ -s "$backup_file" ]]; then
+                        cp "$backup_file" "$rules_file"
+                    else
+                        rm -f "$rules_file"
+                    fi
+                    apply_static_default_route_rules "$new_destinations_csv" >/dev/null 2>&1 || true
+                    rm -f "$backup_file"
+                    echo -e "${RED}执行失败: 静态路由追加失败${NC}"
+                    continue
+                fi
+                rm -f "$backup_file"
+                show_static_default_route_status
+                echo -e "${GREEN}静态路由已追加并持久化。${NC}"
+                ;;
+            3)
+                delete_scope=""
+                destinations_csv=""
+                while true; do
+                    echo ""
+                    echo -e "${WHITE}请选择删除范围:${NC}"
+                    echo -e "${GREEN}  1. 删除指定静态路由${NC}"
+                    echo -e "${GREEN}  2. 删除全部静态路由${NC}"
+                    echo -e "${WHITE}  0. 返回${NC}"
+                    printf "%b" "${BOLD}请选择删除范围 [0-2，直接回车保持当前菜单]: ${NC}"
+                    read -r input || input=""
+                    if [[ -z "$input" ]]; then
+                        continue
+                    fi
+                    case "$input" in
+                        1)
+                            while true; do
+                                printf "%b" "${BOLD}请输入要删除的静态路由目标IP或网段，多个用逗号分隔: ${NC}"
+                                read -r input || input=""
+                                if [[ -z "$input" ]]; then
+                                    echo -e "${YELLOW}未输入静态路由目标，请继续输入。${NC}"
+                                    continue
+                                fi
+                                if destinations_csv=$(normalize_existing_static_route_destinations "$input"); then
+                                    delete_scope="PART"
+                                    break
+                                fi
+                                rc=$?
+                                if [[ "$rc" -eq 2 ]]; then
+                                    echo -e "${RED}存在未配置的静态路由，请重新输入。${NC}"
+                                else
+                                    echo -e "${RED}静态路由格式无效，请重新输入。${NC}"
+                                fi
+                            done
+                            break
+                            ;;
+                        2)
+                            delete_scope="ALL"
+                            destinations_csv=$(get_static_default_route_destinations_csv)
+                            if [[ -z "$destinations_csv" ]]; then
+                                echo -e "${YELLOW}当前没有可删除的静态路由。${NC}"
+                                delete_scope=""
+                                break
+                            fi
+                            break
+                            ;;
+                        0|q|Q|exit)
+                            delete_scope="CANCEL"
+                            break
+                            ;;
+                        *)
+                            echo -e "${RED}无效选项: ${input:-空}，请输入 0、1 或 2。${NC}"
+                            ;;
+                    esac
+                done
+                [[ "$delete_scope" == "CANCEL" || -z "$delete_scope" ]] && continue
+                show_static_default_route_delete_detail "$destinations_csv" "$delete_scope"
+                echo ""
+                if ! confirm_y_or_cancel "输入 y/Y 确认删除，直接回车保持当前确认项，输入其他任意内容取消: "; then
+                    echo -e "${YELLOW}已取消删除。${NC}"
+                    continue
+                fi
+                if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+                    echo -e "${RED}执行失败: 该功能需要 root 权限，请先 sudo -s 后重新执行。${NC}"
+                    continue
+                fi
+                old_destinations_csv=$(get_static_default_route_destinations_csv)
+                backup_file=$(mktemp)
+                [[ -f "$rules_file" ]] && cp "$rules_file" "$backup_file" || : > "$backup_file"
+                if [[ "$delete_scope" == "ALL" ]]; then
+                    new_destinations_csv=""
+                else
+                    new_destinations_csv=$(subtract_static_route_destinations_csv "$old_destinations_csv" "$destinations_csv")
+                fi
+                write_static_default_route_rules_from_csv "$new_destinations_csv"
+                if ! apply_static_default_route_rules "$old_destinations_csv"; then
+                    echo -e "${YELLOW}正在回滚到应用前的静态路由配置...${NC}"
+                    if [[ -s "$backup_file" ]]; then
+                        cp "$backup_file" "$rules_file"
+                    else
+                        rm -f "$rules_file"
+                    fi
+                    apply_static_default_route_rules "$new_destinations_csv" >/dev/null 2>&1 || true
+                    rm -f "$backup_file"
+                    echo -e "${RED}执行失败: 静态路由删除失败${NC}"
+                    continue
+                fi
+                rm -f "$backup_file"
+                show_static_default_route_status
+                echo -e "${GREEN}静态路由已删除并同步持久化。${NC}"
+                ;;
+            0|q|Q|exit)
+                echo -e "${YELLOW}未执行任何静态路由变更。${NC}"
+                return 0
+                ;;
+            *)
+                echo -e "${RED}无效选项: ${action:-空}，请输入 0、1、2 或 3。${NC}"
+                ;;
+        esac
+    done
 }
 
 validate_tcp_port() {
@@ -2733,7 +3422,7 @@ run_optimizer_menu() {
         echo -e "${BOLD}${CYAN}============================================================${NC}"
         echo -e "${GREEN}  1. 清理已有的POP连接信息，重新选择POP点连接${NC}"
         echo -e "${GREEN}  2. 将自动选点修改为固定POP点${NC}"
-        echo -e "${GREEN}  3. 默认路由入口流量强制从默认路由口出${NC}"
+        echo -e "${GREEN}  3. 静态路由默认出接口管理${NC}"
         echo -e "${GREEN}  4. TCP透明代理(iptables REDIRECT + Nginx stream)${NC}"
         echo -e "${WHITE}  0. 返回/退出${NC}"
         echo -e "${BOLD}${CYAN}------------------------------------------------------------${NC}"
@@ -3412,6 +4101,9 @@ check_dns_resolv_conf() {
 
 check_management_backend() {
     # 官方健康检查已确认连接管理后台成功时，跳过单独后台连接检查，避免重复巡检。
+    local platform_token_cmd
+    local platform_token_raw
+    local platform_token_output
     PLATFORM=$(grep '^url:' /opt/feilian/cpe/conf/config.yaml 2>/dev/null | awk '{print $2}' | tr -d "'")
     if should_show_detail_check "${CPE_HEALTH_PLATFORM_OK:-false}"; then
         # 管理平台HTTPS连接与认证凭据校验（token接口返回code=0代表成功）
@@ -3419,29 +4111,34 @@ check_management_backend() {
         CURL_WAN_LABEL="${CURL_WAN_DEV:-未指定(未找到非tun默认路由)}"
         CURL_WAN_ARG=""
         [[ -n "$CURL_WAN_DEV" ]] && CURL_WAN_ARG="--interface $CURL_WAN_DEV"
-        PLATFORM_TOKEN_CMD="printf '%s\n' \"curl出接口: ${CURL_WAN_LABEL}\"; resp=\$(curl ${CURL_WAN_ARG} -sk -w '\nHTTP_STATUS:%{http_code}\n' \"\$(sed -n 's/^url: //p' /opt/feilian/cpe/conf/config.yaml)/api/open/v1/token\" -H 'Content-Type: application/json' -d \"{\\\"access_key_id\\\":\\\"\$(sed -n 's/^app_id: //p' /opt/feilian/cpe/conf/config.yaml)\\\",\\\"access_key_secret\\\":\\\"\$(sed -n 's/^app_secret: //p' /opt/feilian/cpe/conf/config.yaml)\\\"}\" 2>&1); echo \"\$resp\" | grep -q '\"code\":0' && echo '认证接口返回: code=0' || echo '认证接口返回: 未返回code=0'; echo \"\$resp\" | awk -F: '/^HTTP_STATUS:/ {print \"HTTP状态: \" \$2; exit}'"
-        PLATFORM_TOKEN_OUTPUT=$(eval "$PLATFORM_TOKEN_CMD" 2>&1 || true)
-        if echo "$PLATFORM_TOKEN_OUTPUT" | grep -q '"code":0'; then
+        platform_token_cmd="curl ${CURL_WAN_ARG} -skv \"\$(sed -n 's/^url: //p' /opt/feilian/cpe/conf/config.yaml)/api/open/v1/token\" -H 'Content-Type: application/json' -d \"{\\\"access_key_id\\\":\\\"\$(sed -n 's/^app_id: //p' /opt/feilian/cpe/conf/config.yaml)\\\",\\\"access_key_secret\\\":\\\"\$(sed -n 's/^app_secret: //p' /opt/feilian/cpe/conf/config.yaml)\\\"}\" 2>&1"
+        platform_token_raw=$(eval "$platform_token_cmd" 2>&1 || true)
+        platform_token_output=$(printf 'curl出接口: %s\n%s\n' "$CURL_WAN_LABEL" "$platform_token_raw")
+        if echo "$platform_token_raw" | grep -q '"code":0'; then
             PLATFORM_EXTRA="${GREEN}◆ 判断原因: 管理平台${PLATFORM}/api/open/v1/token访问成功，返回code=0，HTTPS连通性与认证凭据校验均正常${NC}"
             PLATFORM_CODE=0
         else
-            PLATFORM_HTTP_STATUS=$(echo "$PLATFORM_TOKEN_OUTPUT" | awk -F: '/^HTTP状态:/ {gsub(/^[[:space:]]+/, "", $2); print $2; exit}')
+            PLATFORM_HTTP_STATUS=$(echo "$platform_token_raw" | awk '/< HTTP\// {status=$3} END {print status}')
             PLATFORM_EXTRA="${RED}◆ 判断原因: token接口未返回code=0，HTTP状态=${PLATFORM_HTTP_STATUS:-N/A}，请检查管理平台连通性或认证凭据配置${NC}"
             PLATFORM_CODE=1
         fi
 
         print_check "连接管理后台" \
-            "$PLATFORM_TOKEN_CMD" \
+            "printf '%s\n' \"curl出接口: ${CURL_WAN_LABEL}\"; ${platform_token_cmd}" \
             "调用/api/open/v1/token应返回code=0，代表HTTPS连通性与认证凭据校验成功" \
             "请检查管理平台地址、HTTPS连通性、app_id/app_secret配置和证书链信任情况" \
             "$PLATFORM_EXTRA" \
             "$PLATFORM_CODE" \
-            "$PLATFORM_TOKEN_OUTPUT"
+            "$platform_token_output"
     fi
 }
 
 check_management_grpc() {
     # 官方健康检查已确认连接管理后台GRPC成功时，跳过单独GRPC检查，避免重复巡检。
+    local mgmt_token_cmd
+    local mgmt_grpc_cmd
+    local mgmt_token_raw
+    local mgmt_grpc_raw
     if should_show_detail_check "${CPE_HEALTH_MGMT_GRPC_OK:-false}"; then
         # 连接管理后台GRPC（token + gRPC HTTP/2探测）
         MGMT_GRPC_ENDPOINT=$(awk -F "'" '/option ops_controller_grpc_addr/ {print $2; exit}' /opt/feilian/cpe/.cache/ucistore 2>/dev/null)
@@ -3451,10 +4148,17 @@ check_management_grpc() {
         CURL_WAN_LABEL="${CURL_WAN_DEV:-未指定(未找到非tun默认路由)}"
         CURL_WAN_ARG=""
         [[ -n "$CURL_WAN_DEV" ]] && CURL_WAN_ARG="--interface $CURL_WAN_DEV"
-        MGMT_GRPC_CMD="u=\$(sed -n 's/^url: //p' /opt/feilian/cpe/conf/config.yaml); printf '%s\n' \"curl出接口: ${CURL_WAN_LABEL}\"; cred_resp=\$(curl ${CURL_WAN_ARG} -sk \"\$u/api/open/v1/token\" -H 'Content-Type: application/json' -d \"{\\\"access_key_id\\\":\\\"\$(sed -n 's/^app_id: //p' /opt/feilian/cpe/conf/config.yaml)\\\",\\\"access_key_secret\\\":\\\"\$(sed -n 's/^app_secret: //p' /opt/feilian/cpe/conf/config.yaml)\\\"}\" 2>&1); cred=\$(echo \"\$cred_resp\" | sed -n 's/.*\"access_token\":\"\\([^\"]*\\)\".*/\\1/p'); ep=\$(awk -F \"'\" '/option ops_controller_grpc_addr/ {print \$2; exit}' /opt/feilian/cpe/.cache/ucistore | tr : ' '); host=\$(echo \"\$ep\" | awk '{print \$1}'); port=\$(echo \"\$ep\" | awk '{print \$2}'); [ -n \"\$cred\" ] && echo '认证接口返回: 已获取访问凭据' || echo '认证接口返回: 未获取访问凭据'; echo \"管理后台GRPC地址: \$host:\$port\"; if [ -n \"\$cred\" ] && [ -n \"\$host\" ] && [ -n \"\$port\" ]; then curl ${CURL_WAN_ARG} -sk -o /dev/null -w 'HTTP状态: %{http_code}\n' \"https://\$host:\$port\" -X POST -H \"Authorization: Bearer \$cred\" -H 'content-type: application/grpc+proto' 2>&1; else echo '获取访问凭据或GRPC地址失败'; fi"
-        MGMT_GRPC_OUTPUT=$(eval "$MGMT_GRPC_CMD" 2>&1 || true)
-        MGMT_GRPC_HTTP_STATUS=$(echo "$MGMT_GRPC_OUTPUT" | awk -F: '/^HTTP状态:/ {gsub(/^[[:space:]]+/, "", $2); print $2; exit}')
-        if echo "$MGMT_GRPC_OUTPUT" | grep -q '已获取访问凭据' && [[ "$MGMT_GRPC_HTTP_STATUS" == "200" ]]; then
+        mgmt_token_cmd="curl ${CURL_WAN_ARG} -skS --http2 -D - \"\$(sed -n 's/^url: //p' /opt/feilian/cpe/conf/config.yaml)/api/open/v1/token\" -H 'Content-Type: application/json' -d \"{\\\"access_key_id\\\":\\\"\$(sed -n 's/^app_id: //p' /opt/feilian/cpe/conf/config.yaml)\\\",\\\"access_key_secret\\\":\\\"\$(sed -n 's/^app_secret: //p' /opt/feilian/cpe/conf/config.yaml)\\\"}\" 2>&1"
+        mgmt_token_raw=$(eval "$mgmt_token_cmd" 2>&1 || true)
+        cred=$(echo "$mgmt_token_raw" | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+        mgmt_grpc_raw="获取访问凭据或GRPC地址失败"
+        if [[ -n "$cred" && -n "$MGMT_GRPC_HOST" && -n "$MGMT_GRPC_PORT" ]]; then
+            mgmt_grpc_cmd="curl ${CURL_WAN_ARG} -skv \"https://${MGMT_GRPC_HOST}:${MGMT_GRPC_PORT}\" -X POST -H \"Authorization: Bearer ${cred}\" -H 'content-type: application/grpc+proto' 2>&1"
+            mgmt_grpc_raw=$(eval "$mgmt_grpc_cmd" 2>&1 || true)
+        fi
+        MGMT_GRPC_OUTPUT=$(printf 'curl出接口: %s\n=== token接口探测 ===\n%s\n管理后台GRPC地址: %s:%s\n=== 管理后台GRPC探测 ===\n%s\n' "$CURL_WAN_LABEL" "$mgmt_token_raw" "${MGMT_GRPC_HOST:-}" "${MGMT_GRPC_PORT:-}" "$mgmt_grpc_raw")
+        MGMT_GRPC_HTTP_STATUS=$(echo "$mgmt_grpc_raw" | awk '/< HTTP\// {status=$3} END {print status}')
+        if [[ -n "$cred" && "$MGMT_GRPC_HTTP_STATUS" == "200" ]]; then
             MGMT_GRPC_EXTRA="${GREEN}◆ 判断原因: 访问凭据获取成功，管理后台GRPC ${MGMT_GRPC_HOST:-N/A}:${MGMT_GRPC_PORT:-N/A} 返回HTTP 200，连接成功${NC}"
             MGMT_GRPC_CODE=0
         else
@@ -3463,7 +4167,7 @@ check_management_grpc() {
         fi
 
         print_check "连接管理后台GRPC" \
-            "$MGMT_GRPC_CMD" \
+            "printf '%s\n' \"curl出接口: ${CURL_WAN_LABEL}\"; echo '=== token接口探测 ==='; ${mgmt_token_cmd}; echo \"管理后台GRPC地址: ${MGMT_GRPC_HOST:-} : ${MGMT_GRPC_PORT:-}\"; echo '=== 管理后台GRPC探测 ==='; ${mgmt_grpc_cmd:-echo '获取访问凭据或GRPC地址失败'}" \
             "应能获取访问凭据，并使用Bearer认证信息连接管理后台GRPC返回HTTP 200" \
             "请检查认证凭据、ops_controller_grpc_addr配置、DNS解析、49905端口和管理后台GRPC服务状态" \
             "$MGMT_GRPC_EXTRA" \
@@ -3474,6 +4178,10 @@ check_management_grpc() {
 
 check_center_dns_grpc() {
     # 官方健康检查已确认连接中心DNS GRPC成功时，跳过单独GRPC检查，避免重复巡检。
+    local center_dns_token_cmd
+    local center_dns_grpc_cmd
+    local center_dns_token_raw
+    local center_dns_grpc_raw
     if should_show_detail_check "${CPE_HEALTH_CENTER_DNS_GRPC_OK:-false}"; then
         CENTER_DNS_GRPC_ENDPOINT=$(awk -F "'" '/option dns_controller_grpc_addr/ {print $2; exit}' /opt/feilian/cpe/.cache/ucistore 2>/dev/null)
         CENTER_DNS_GRPC_HOST=$(echo "$CENTER_DNS_GRPC_ENDPOINT" | sed -E 's#^[a-zA-Z]+://##; s/:?[0-9]+$//')
@@ -3482,10 +4190,17 @@ check_center_dns_grpc() {
         CURL_WAN_LABEL="${CURL_WAN_DEV:-未指定(未找到非tun默认路由)}"
         CURL_WAN_ARG=""
         [[ -n "$CURL_WAN_DEV" ]] && CURL_WAN_ARG="--interface $CURL_WAN_DEV"
-        CENTER_DNS_GRPC_CMD="u=\$(sed -n 's/^url: //p' /opt/feilian/cpe/conf/config.yaml); printf '%s\n' \"curl出接口: ${CURL_WAN_LABEL}\"; cred_resp=\$(curl ${CURL_WAN_ARG} -sk \"\$u/api/open/v1/token\" -H 'Content-Type: application/json' -d \"{\\\"access_key_id\\\":\\\"\$(sed -n 's/^app_id: //p' /opt/feilian/cpe/conf/config.yaml)\\\",\\\"access_key_secret\\\":\\\"\$(sed -n 's/^app_secret: //p' /opt/feilian/cpe/conf/config.yaml)\\\"}\" 2>&1); cred=\$(echo \"\$cred_resp\" | sed -n 's/.*\"access_token\":\"\\([^\"]*\\)\".*/\\1/p'); ep=\$(awk -F \"'\" '/option dns_controller_grpc_addr/ {print \$2; exit}' /opt/feilian/cpe/.cache/ucistore | tr : ' '); host=\$(echo \"\$ep\" | awk '{print \$1}'); port=\$(echo \"\$ep\" | awk '{print \$2}'); [ -n \"\$cred\" ] && echo '认证接口返回: 已获取访问凭据' || echo '认证接口返回: 未获取访问凭据'; echo \"连接中心DNS GRPC地址: \$host:\$port\"; if [ -n \"\$cred\" ] && [ -n \"\$host\" ] && [ -n \"\$port\" ]; then curl ${CURL_WAN_ARG} -sk -o /dev/null -w 'HTTP状态: %{http_code}\n' \"https://\$host:\$port\" -X POST -H \"Authorization: Bearer \$cred\" -H 'content-type: application/grpc+proto' 2>&1; else echo '获取访问凭据或DNS GRPC地址失败'; fi"
-        CENTER_DNS_GRPC_OUTPUT=$(eval "$CENTER_DNS_GRPC_CMD" 2>&1 || true)
-        CENTER_DNS_GRPC_HTTP_STATUS=$(echo "$CENTER_DNS_GRPC_OUTPUT" | awk -F: '/^HTTP状态:/ {gsub(/^[[:space:]]+/, "", $2); print $2; exit}')
-        if echo "$CENTER_DNS_GRPC_OUTPUT" | grep -q '已获取访问凭据' && [[ "$CENTER_DNS_GRPC_HTTP_STATUS" == "200" ]]; then
+        center_dns_token_cmd="curl ${CURL_WAN_ARG} -skS --http2 -D - \"\$(sed -n 's/^url: //p' /opt/feilian/cpe/conf/config.yaml)/api/open/v1/token\" -H 'Content-Type: application/json' -d \"{\\\"access_key_id\\\":\\\"\$(sed -n 's/^app_id: //p' /opt/feilian/cpe/conf/config.yaml)\\\",\\\"access_key_secret\\\":\\\"\$(sed -n 's/^app_secret: //p' /opt/feilian/cpe/conf/config.yaml)\\\"}\" 2>&1"
+        center_dns_token_raw=$(eval "$center_dns_token_cmd" 2>&1 || true)
+        cred=$(echo "$center_dns_token_raw" | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')
+        center_dns_grpc_raw="获取访问凭据或DNS GRPC地址失败"
+        if [[ -n "$cred" && -n "$CENTER_DNS_GRPC_HOST" && -n "$CENTER_DNS_GRPC_PORT" ]]; then
+            center_dns_grpc_cmd="curl ${CURL_WAN_ARG} -skv \"https://${CENTER_DNS_GRPC_HOST}:${CENTER_DNS_GRPC_PORT}\" -X POST -H \"Authorization: Bearer ${cred}\" -H 'content-type: application/grpc+proto' 2>&1"
+            center_dns_grpc_raw=$(eval "$center_dns_grpc_cmd" 2>&1 || true)
+        fi
+        CENTER_DNS_GRPC_OUTPUT=$(printf 'curl出接口: %s\n=== token接口探测 ===\n%s\n连接中心DNS GRPC地址: %s:%s\n=== 连接中心DNS GRPC探测 ===\n%s\n' "$CURL_WAN_LABEL" "$center_dns_token_raw" "${CENTER_DNS_GRPC_HOST:-}" "${CENTER_DNS_GRPC_PORT:-}" "$center_dns_grpc_raw")
+        CENTER_DNS_GRPC_HTTP_STATUS=$(echo "$center_dns_grpc_raw" | awk '/< HTTP\// {status=$3} END {print status}')
+        if [[ -n "$cred" && "$CENTER_DNS_GRPC_HTTP_STATUS" == "200" ]]; then
             CENTER_DNS_GRPC_EXTRA="${GREEN}◆ 判断原因: 访问凭据获取成功，连接中心DNS GRPC ${CENTER_DNS_GRPC_HOST:-N/A}:${CENTER_DNS_GRPC_PORT:-N/A} 返回HTTP 200，连接成功${NC}"
             CENTER_DNS_GRPC_CODE=0
         else
@@ -3494,7 +4209,7 @@ check_center_dns_grpc() {
         fi
 
         print_check "连接中心DNS GRPC" \
-            "$CENTER_DNS_GRPC_CMD" \
+            "printf '%s\n' \"curl出接口: ${CURL_WAN_LABEL}\"; echo '=== token接口探测 ==='; ${center_dns_token_cmd}; echo \"连接中心DNS GRPC地址: ${CENTER_DNS_GRPC_HOST:-} : ${CENTER_DNS_GRPC_PORT:-}\"; echo '=== 连接中心DNS GRPC探测 ==='; ${center_dns_grpc_cmd:-echo '获取访问凭据或DNS GRPC地址失败'}" \
             "应能获取访问凭据，并使用Bearer认证信息连接中心DNS GRPC返回HTTP 200" \
             "请检查认证凭据、dns_controller_grpc_addr配置、DNS解析、49920端口和连接中心DNS GRPC服务状态" \
             "$CENTER_DNS_GRPC_EXTRA" \
@@ -3507,7 +4222,7 @@ check_center_dns_udp() {
     # 官方健康检查已确认中心DNS UDP端口探测成功时，跳过单独探测，避免重复巡检。
     if should_show_detail_check "${CPE_HEALTH_CENTER_DNS_UDP_OK:-false}"; then
         # 中心 DNS UDP端口探测（认证凭据 + UDP 443 DNS探测）
-        CENTER_DNS_UDP_CMD="cred_json=\$(awk -F \"'\" '/option token/ {print \$2; exit}' /opt/feilian/cpe/.cache/ucistore 2>/dev/null); if command -v jq >/dev/null 2>&1; then cred=\$(echo \"\$cred_json\" | jq -r .access_token 2>/dev/null); else cred=\$(echo \"\$cred_json\" | sed -n 's/.*\"access_token\":\"\\([^\"]*\\)\".*/\\1/p'); fi; cred_len=\$(echo \"\$cred\" | wc -c); [ \"\$cred_len\" -eq 41 ] && echo '认证凭据 验证成功' || echo '认证凭据 验证失败'; dns_ip=\$(awk -F '=' '/add-dns-server-ip/ {print \$2; exit}' /etc/dnsmasq.d/cpe.conf 2>/dev/null); echo \"中心 DNS: \${dns_ip:-未配置}\"; if [ -n \"\$dns_ip\" ]; then dev=\$(ip route get \"\$dns_ip\" 2>/dev/null | awk '{for(i=1;i<=NF;i++){if(\$i==\"dev\" && (i+1)<=NF){print \$(i+1); exit}}}'); echo \"出接口: \${dev:-未获取}\"; else echo '出接口: 未获取'; fi; if [ -n \"\$dns_ip\" ] && command -v dig >/dev/null 2>&1; then dig @\"\$dns_ip\" apple.com +timeout=1 +retry=2 -p 443 >/dev/null 2>&1 && echo '中心 DNS UDP端口探测成功' || echo '中心 DNS UDP端口探测失败'; elif ! command -v dig >/dev/null 2>&1; then echo '中心 DNS UDP端口探测失败: dig命令不存在'; else echo '中心 DNS UDP端口探测失败: 未获取到中心DNS地址'; fi"
+        CENTER_DNS_UDP_CMD="cred_json=\$(awk -F \"'\" '/option token/ {print \$2; exit}' /opt/feilian/cpe/.cache/ucistore 2>/dev/null); if command -v jq >/dev/null 2>&1; then cred=\$(echo \"\$cred_json\" | jq -r .access_token 2>/dev/null); else cred=\$(echo \"\$cred_json\" | sed -n 's/.*\"access_token\":\"\\([^\"]*\\)\".*/\\1/p'); fi; cred_len=\$(echo \"\$cred\" | wc -c); [ \"\$cred_len\" -eq 41 ] && echo '认证凭据 验证成功' || echo '认证凭据 验证失败'; dns_ip=\$(awk -F '=' '/add-dns-server-ip/ {print \$2; exit}' /etc/dnsmasq.d/cpe.conf 2>/dev/null); echo \"中心 DNS: \${dns_ip:-未配置}\"; if [ -n \"\$dns_ip\" ]; then dev=\$(ip route get \"\$dns_ip\" 2>/dev/null | awk '{for(i=1;i<=NF;i++){if(\$i==\"dev\" && (i+1)<=NF){print \$(i+1); exit}}}'); echo \"出接口: \${dev:-未获取}\"; else echo '出接口: 未获取'; fi; if [ -n \"\$dns_ip\" ] && command -v dig >/dev/null 2>&1; then echo '=== UDP 443 DNS探测 ==='; echo \"探测命令: dig @\$dns_ip apple.com A +time=1 +tries=2 -p 443 +noall +answer +comments +stats\"; dig_output=\$(dig @\"\$dns_ip\" apple.com A +time=1 +tries=2 -p 443 +noall +answer +comments +stats 2>&1); printf '%s\n' \"\$dig_output\"; if printf '%s\n' \"\$dig_output\" | grep -Eq 'status: NOERROR|status: FORMERR|[[:space:]]IN[[:space:]]+(A|AAAA|CNAME)[[:space:]]'; then if printf '%s\n' \"\$dig_output\" | grep -q 'status: FORMERR'; then echo '中心 DNS UDP端口探测成功(FORMERR表示服务端已响应)'; else echo '中心 DNS UDP端口探测成功'; fi; else echo '中心 DNS UDP端口探测失败'; fi; elif ! command -v dig >/dev/null 2>&1; then echo '中心 DNS UDP端口探测失败: dig命令不存在'; else echo '中心 DNS UDP端口探测失败: 未获取到中心DNS地址'; fi"
         CENTER_DNS_UDP_OUTPUT=$(eval "$CENTER_DNS_UDP_CMD" 2>&1 || true)
         CENTER_DNS_UDP_IP=$(awk -F '=' '/add-dns-server-ip/ {print $2; exit}' /etc/dnsmasq.d/cpe.conf 2>/dev/null)
         CENTER_DNS_UDP_ISSUES=()
@@ -3515,7 +4230,11 @@ check_center_dns_udp() {
         [[ -n "$CENTER_DNS_UDP_IP" ]] || CENTER_DNS_UDP_ISSUES+=("未获取到中心DNS地址")
         echo "$CENTER_DNS_UDP_OUTPUT" | grep -q '中心 DNS UDP端口探测成功' || CENTER_DNS_UDP_ISSUES+=("中心DNS UDP 443探测失败")
         if [[ "${#CENTER_DNS_UDP_ISSUES[@]}" -eq 0 ]]; then
-            CENTER_DNS_UDP_EXTRA="${GREEN}◆ 判断原因: 认证凭据验证成功，中心DNS ${CENTER_DNS_UDP_IP}:443 UDP探测成功${NC}"
+            if echo "$CENTER_DNS_UDP_OUTPUT" | grep -q 'status: FORMERR'; then
+                CENTER_DNS_UDP_EXTRA="${GREEN}◆ 判断原因: 认证凭据验证成功，中心DNS ${CENTER_DNS_UDP_IP}:443 UDP探测已收到服务端响应，返回FORMERR也按成功处理${NC}"
+            else
+                CENTER_DNS_UDP_EXTRA="${GREEN}◆ 判断原因: 认证凭据验证成功，中心DNS ${CENTER_DNS_UDP_IP}:443 UDP探测成功${NC}"
+            fi
             CENTER_DNS_UDP_CODE=0
         else
             CENTER_DNS_UDP_EXTRA="${RED}◆ 判断原因: $(IFS='，'; echo "${CENTER_DNS_UDP_ISSUES[*]}")${NC}"
@@ -4161,6 +4880,12 @@ prompt_ip_publish_target() {
 validate_domain_name() {
     local domain="$1"
     [[ "$domain" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]
+}
+
+validate_iface_name() {
+    local iface="${1:-}"
+    [[ -n "$iface" ]] || return 1
+    [[ "$iface" =~ ^[A-Za-z0-9._:-]+$ ]]
 }
 
 prompt_domain_schedule_domain() {
@@ -4903,10 +5628,18 @@ main() {
                     exit 127
                 fi
                 IP_PUBLISH_IFACE="$2"
+                if ! validate_iface_name "$IP_PUBLISH_IFACE"; then
+                    echo "参数错误: 接口名格式无效: $IP_PUBLISH_IFACE" >&2
+                    exit 127
+                fi
                 shift 2
                 ;;
             --iface=*)
                 IP_PUBLISH_IFACE="${1#*=}"
+                if ! validate_iface_name "$IP_PUBLISH_IFACE"; then
+                    echo "参数错误: 接口名格式无效: $IP_PUBLISH_IFACE" >&2
+                    exit 127
+                fi
                 shift
                 ;;
             -o|--output)
