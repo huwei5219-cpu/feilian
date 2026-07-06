@@ -128,6 +128,16 @@ string_display_width() {
     fi
 }
 
+redact_sensitive_text() {
+    sed -E \
+        -e 's/("access_key_id"[[:space:]]*:[[:space:]]*")[^"]*"/\1***REDACTED***"/g' \
+        -e 's/("access_key_secret"[[:space:]]*:[[:space:]]*")[^"]*"/\1***REDACTED***"/g' \
+        -e 's/("access_token"[[:space:]]*:[[:space:]]*")[^"]*"/\1***REDACTED***"/g' \
+        -e 's/(Authorization:[[:space:]]*Bearer[[:space:]]+)[^[:space:]]+/\1***REDACTED***/Ig' \
+        -e 's/(access_key_secret[^[:space:]]*)[[:space:]]+[^[:space:]]+/\1 ***REDACTED***/Ig' \
+        -e 's/(app_secret[^[:space:]]*)[[:space:]]+[^[:space:]]+/\1 ***REDACTED***/Ig'
+}
+
 print_check() {
     local check_name="$1"
     local cmd="$2"
@@ -138,6 +148,8 @@ print_check() {
     local precomputed_output="${7:-}" # 可选：复用脚本内部已采集的输出，避免命令重复执行
     local output
     local exit_code
+    local display_cmd
+    local display_output
     
     TOTAL_CHECKS=$((TOTAL_CHECKS + 1)) || true
 
@@ -152,6 +164,8 @@ print_check() {
     if [[ -n "$forced_exit_code" ]]; then
         exit_code="$forced_exit_code"
     fi
+    display_cmd=$(printf '%s' "$cmd" | redact_sensitive_text)
+    display_output=$(printf '%s' "$output" | redact_sensitive_text)
     if [[ $exit_code -eq 0 ]]; then
         PASSED_CHECKS=$((PASSED_CHECKS + 1)) || true
     elif [[ $exit_code -eq 2 ]]; then
@@ -188,12 +202,12 @@ print_check() {
             echo -e "${WHITE}【检查要求】${NC}: ${requirement}"
         fi
 
-        printf "%b%s%b\n" "${WHITE}【使用命令】${NC}: ${CYAN}" "$cmd" "$NC"
+        printf "%b%s%b\n" "${WHITE}【使用命令】${NC}: ${CYAN}" "$display_cmd" "$NC"
 
         echo -e "${WHITE}【回显结果】${NC}:"
         while IFS= read -r line; do
             echo -e "     | ${CYAN}${line}${NC}"
-        done <<< "$output"
+        done <<< "$display_output"
 
         # 状态显示：✅通过 / ❌不通过 + 判断原因
         if [[ $exit_code -eq 0 ]]; then
@@ -717,7 +731,11 @@ prompt_pop_ip() {
     local current_ip="$2"
     local input
     while true; do
-        printf "%b" "${BOLD}请输入${label}POP IP [当前 ${current_ip}]: ${NC}" >&2
+        if [[ -n "$current_ip" ]]; then
+            printf "%b" "${BOLD}请输入${label}POP IP [当前 ${current_ip}]: ${NC}" >&2
+        else
+            printf "%b" "${BOLD}请输入${label}POP IP: ${NC}" >&2
+        fi
         read -r input || input=""
         input=$(normalize_ipv4_input "$input")
         if [[ -z "$input" ]]; then
@@ -1501,8 +1519,6 @@ run_fixed_pop_optimizer() {
     cli_output=$(get_feilian_tun_cli_output 2>/dev/null || true)
     default_master_ip=$(extract_endpoint_ip "$(extract_tun_endpoint "$cli_output" "tun0_master")")
     default_slave_ip=$(extract_endpoint_ip "$(extract_tun_endpoint "$cli_output" "tun0_slave")")
-    default_master_ip="${default_master_ip:-39.156.151.214}"
-    default_slave_ip="${default_slave_ip:-180.184.170.39}"
 
     show_specified_pop_selection_info "$default_master_ip" "$default_slave_ip" "当前选点信息"
     master_ip=$(prompt_pop_ip "固定的主" "$default_master_ip") || return 1
@@ -3247,7 +3263,7 @@ check_cpe_network_health() {
     print_check "执行CPE网络健康检查脚本" \
         "printf '%s\n' \"默认出接口: ${CPE_HEALTH_WAN_LABEL}\"; /opt/feilian/cpe/bin/feilian-cpe-health-check 2>&1" \
         "脚本正常执行，网络健康检查项均需显示成功；探测网关仅展示，不参与通过/失败判断" \
-        "请再次尝试执行健康检查脚本/opt/feilian/cpe/bin/feilian-cpe-health-check 2>&1，如还有问题请根据非成功项排查网络、DNS、GRPC、AK/SK或隧道连通性" \
+        "请再次尝试执行健康检查脚本/opt/feilian/cpe/bin/feilian-cpe-health-check 2>&1，如还有问题请根据非成功项排查网络、DNS、GRPC、认证凭据或隧道连通性" \
         "$CPE_HEALTH_EXTRA" \
         "$CPE_HEALTH_CODE" \
         "$CPE_HEALTH_OUTPUT"
@@ -3398,25 +3414,25 @@ check_management_backend() {
     # 官方健康检查已确认连接管理后台成功时，跳过单独后台连接检查，避免重复巡检。
     PLATFORM=$(grep '^url:' /opt/feilian/cpe/conf/config.yaml 2>/dev/null | awk '{print $2}' | tr -d "'")
     if should_show_detail_check "${CPE_HEALTH_PLATFORM_OK:-false}"; then
-        # 管理平台HTTPS连接与AK/SK校验（token接口返回code=0代表成功）
+        # 管理平台HTTPS连接与认证凭据校验（token接口返回code=0代表成功）
         CURL_WAN_DEV=$(get_default_wan_dev)
         CURL_WAN_LABEL="${CURL_WAN_DEV:-未指定(未找到非tun默认路由)}"
         CURL_WAN_ARG=""
         [[ -n "$CURL_WAN_DEV" ]] && CURL_WAN_ARG="--interface $CURL_WAN_DEV"
-        PLATFORM_TOKEN_CMD="printf '%s\n' \"curl出接口: ${CURL_WAN_LABEL}\"; curl ${CURL_WAN_ARG} -kv \"\$(sed -n 's/^url: //p' /opt/feilian/cpe/conf/config.yaml)/api/open/v1/token\" -H 'Content-Type: application/json' -d \"{\\\"access_key_id\\\":\\\"\$(sed -n 's/^app_id: //p' /opt/feilian/cpe/conf/config.yaml)\\\",\\\"access_key_secret\\\":\\\"\$(sed -n 's/^app_secret: //p' /opt/feilian/cpe/conf/config.yaml)\\\"}\" 2>&1"
+        PLATFORM_TOKEN_CMD="printf '%s\n' \"curl出接口: ${CURL_WAN_LABEL}\"; resp=\$(curl ${CURL_WAN_ARG} -sk -w '\nHTTP_STATUS:%{http_code}\n' \"\$(sed -n 's/^url: //p' /opt/feilian/cpe/conf/config.yaml)/api/open/v1/token\" -H 'Content-Type: application/json' -d \"{\\\"access_key_id\\\":\\\"\$(sed -n 's/^app_id: //p' /opt/feilian/cpe/conf/config.yaml)\\\",\\\"access_key_secret\\\":\\\"\$(sed -n 's/^app_secret: //p' /opt/feilian/cpe/conf/config.yaml)\\\"}\" 2>&1); echo \"\$resp\" | grep -q '\"code\":0' && echo '认证接口返回: code=0' || echo '认证接口返回: 未返回code=0'; echo \"\$resp\" | awk -F: '/^HTTP_STATUS:/ {print \"HTTP状态: \" \$2; exit}'"
         PLATFORM_TOKEN_OUTPUT=$(eval "$PLATFORM_TOKEN_CMD" 2>&1 || true)
         if echo "$PLATFORM_TOKEN_OUTPUT" | grep -q '"code":0'; then
-            PLATFORM_EXTRA="${GREEN}◆ 判断原因: 管理平台${PLATFORM}/api/open/v1/token访问成功，返回code=0，HTTPS连通性与AK/SK校验均正常${NC}"
+            PLATFORM_EXTRA="${GREEN}◆ 判断原因: 管理平台${PLATFORM}/api/open/v1/token访问成功，返回code=0，HTTPS连通性与认证凭据校验均正常${NC}"
             PLATFORM_CODE=0
         else
-            PLATFORM_HTTP_STATUS=$(echo "$PLATFORM_TOKEN_OUTPUT" | awk '/< HTTP\// {print $3; exit}')
-            PLATFORM_EXTRA="${RED}◆ 判断原因: token接口未返回code=0，HTTP状态=${PLATFORM_HTTP_STATUS:-N/A}，请检查管理平台连通性或AK/SK配置${NC}"
+            PLATFORM_HTTP_STATUS=$(echo "$PLATFORM_TOKEN_OUTPUT" | awk -F: '/^HTTP状态:/ {gsub(/^[[:space:]]+/, "", $2); print $2; exit}')
+            PLATFORM_EXTRA="${RED}◆ 判断原因: token接口未返回code=0，HTTP状态=${PLATFORM_HTTP_STATUS:-N/A}，请检查管理平台连通性或认证凭据配置${NC}"
             PLATFORM_CODE=1
         fi
 
         print_check "连接管理后台" \
             "$PLATFORM_TOKEN_CMD" \
-            "调用/api/open/v1/token应返回code=0，代表HTTPS连通性与AK/SK校验成功" \
+            "调用/api/open/v1/token应返回code=0，代表HTTPS连通性与认证凭据校验成功" \
             "请检查管理平台地址、HTTPS连通性、app_id/app_secret配置和证书链信任情况" \
             "$PLATFORM_EXTRA" \
             "$PLATFORM_CODE" \
@@ -3435,21 +3451,21 @@ check_management_grpc() {
         CURL_WAN_LABEL="${CURL_WAN_DEV:-未指定(未找到非tun默认路由)}"
         CURL_WAN_ARG=""
         [[ -n "$CURL_WAN_DEV" ]] && CURL_WAN_ARG="--interface $CURL_WAN_DEV"
-        MGMT_GRPC_CMD="u=\$(sed -n 's/^url: //p' /opt/feilian/cpe/conf/config.yaml); printf '%s\n' \"curl出接口: ${CURL_WAN_LABEL}\"; token_resp=\$(curl ${CURL_WAN_ARG} -sk \"\$u/api/open/v1/token\" -H 'Content-Type: application/json' -d \"{\\\"access_key_id\\\":\\\"\$(sed -n 's/^app_id: //p' /opt/feilian/cpe/conf/config.yaml)\\\",\\\"access_key_secret\\\":\\\"\$(sed -n 's/^app_secret: //p' /opt/feilian/cpe/conf/config.yaml)\\\"}\" 2>&1); token=\$(echo \"\$token_resp\" | sed -n 's/.*\"access_token\":\"\\([^\"]*\\)\".*/\\1/p'); ep=\$(awk -F \"'\" '/option ops_controller_grpc_addr/ {print \$2; exit}' /opt/feilian/cpe/.cache/ucistore | tr : ' '); host=\$(echo \"\$ep\" | awk '{print \$1}'); port=\$(echo \"\$ep\" | awk '{print \$2}'); echo \"token接口返回: \$token_resp\"; echo \"管理后台GRPC地址: \$host:\$port\"; if [ -n \"\$token\" ] && [ -n \"\$host\" ] && [ -n \"\$port\" ]; then curl ${CURL_WAN_ARG} -kv \"https://\$host:\$port\" -X POST -H \"Authorization: Bearer \$token\" -H 'content-type: application/grpc+proto' 2>&1; else echo '获取access_token或GRPC地址失败'; fi"
+        MGMT_GRPC_CMD="u=\$(sed -n 's/^url: //p' /opt/feilian/cpe/conf/config.yaml); printf '%s\n' \"curl出接口: ${CURL_WAN_LABEL}\"; cred_resp=\$(curl ${CURL_WAN_ARG} -sk \"\$u/api/open/v1/token\" -H 'Content-Type: application/json' -d \"{\\\"access_key_id\\\":\\\"\$(sed -n 's/^app_id: //p' /opt/feilian/cpe/conf/config.yaml)\\\",\\\"access_key_secret\\\":\\\"\$(sed -n 's/^app_secret: //p' /opt/feilian/cpe/conf/config.yaml)\\\"}\" 2>&1); cred=\$(echo \"\$cred_resp\" | sed -n 's/.*\"access_token\":\"\\([^\"]*\\)\".*/\\1/p'); ep=\$(awk -F \"'\" '/option ops_controller_grpc_addr/ {print \$2; exit}' /opt/feilian/cpe/.cache/ucistore | tr : ' '); host=\$(echo \"\$ep\" | awk '{print \$1}'); port=\$(echo \"\$ep\" | awk '{print \$2}'); [ -n \"\$cred\" ] && echo '认证接口返回: 已获取访问凭据' || echo '认证接口返回: 未获取访问凭据'; echo \"管理后台GRPC地址: \$host:\$port\"; if [ -n \"\$cred\" ] && [ -n \"\$host\" ] && [ -n \"\$port\" ]; then curl ${CURL_WAN_ARG} -sk -o /dev/null -w 'HTTP状态: %{http_code}\n' \"https://\$host:\$port\" -X POST -H \"Authorization: Bearer \$cred\" -H 'content-type: application/grpc+proto' 2>&1; else echo '获取访问凭据或GRPC地址失败'; fi"
         MGMT_GRPC_OUTPUT=$(eval "$MGMT_GRPC_CMD" 2>&1 || true)
-        MGMT_GRPC_HTTP_STATUS=$(echo "$MGMT_GRPC_OUTPUT" | awk '/< HTTP\// {print $3; exit}')
-        if echo "$MGMT_GRPC_OUTPUT" | grep -q '"access_token":"' && [[ "$MGMT_GRPC_HTTP_STATUS" == "200" ]]; then
-            MGMT_GRPC_EXTRA="${GREEN}◆ 判断原因: access_token获取成功，管理后台GRPC ${MGMT_GRPC_HOST:-N/A}:${MGMT_GRPC_PORT:-N/A} 返回HTTP 200，连接成功${NC}"
+        MGMT_GRPC_HTTP_STATUS=$(echo "$MGMT_GRPC_OUTPUT" | awk -F: '/^HTTP状态:/ {gsub(/^[[:space:]]+/, "", $2); print $2; exit}')
+        if echo "$MGMT_GRPC_OUTPUT" | grep -q '已获取访问凭据' && [[ "$MGMT_GRPC_HTTP_STATUS" == "200" ]]; then
+            MGMT_GRPC_EXTRA="${GREEN}◆ 判断原因: 访问凭据获取成功，管理后台GRPC ${MGMT_GRPC_HOST:-N/A}:${MGMT_GRPC_PORT:-N/A} 返回HTTP 200，连接成功${NC}"
             MGMT_GRPC_CODE=0
         else
-            MGMT_GRPC_EXTRA="${RED}◆ 判断原因: access_token获取或管理后台GRPC连接异常，HTTP状态=${MGMT_GRPC_HTTP_STATUS:-N/A}，GRPC地址=${MGMT_GRPC_HOST:-N/A}:${MGMT_GRPC_PORT:-N/A}${NC}"
+            MGMT_GRPC_EXTRA="${RED}◆ 判断原因: 访问凭据获取或管理后台GRPC连接异常，HTTP状态=${MGMT_GRPC_HTTP_STATUS:-N/A}，GRPC地址=${MGMT_GRPC_HOST:-N/A}:${MGMT_GRPC_PORT:-N/A}${NC}"
             MGMT_GRPC_CODE=1
         fi
 
         print_check "连接管理后台GRPC" \
             "$MGMT_GRPC_CMD" \
-            "应能获取access_token，并使用Bearer token连接管理后台GRPC返回HTTP 200" \
-            "请检查AK/SK、ops_controller_grpc_addr配置、DNS解析、49905端口和管理后台GRPC服务状态" \
+            "应能获取访问凭据，并使用Bearer认证信息连接管理后台GRPC返回HTTP 200" \
+            "请检查认证凭据、ops_controller_grpc_addr配置、DNS解析、49905端口和管理后台GRPC服务状态" \
             "$MGMT_GRPC_EXTRA" \
             "$MGMT_GRPC_CODE" \
             "$MGMT_GRPC_OUTPUT"
@@ -3466,21 +3482,21 @@ check_center_dns_grpc() {
         CURL_WAN_LABEL="${CURL_WAN_DEV:-未指定(未找到非tun默认路由)}"
         CURL_WAN_ARG=""
         [[ -n "$CURL_WAN_DEV" ]] && CURL_WAN_ARG="--interface $CURL_WAN_DEV"
-        CENTER_DNS_GRPC_CMD="u=\$(sed -n 's/^url: //p' /opt/feilian/cpe/conf/config.yaml); printf '%s\n' \"curl出接口: ${CURL_WAN_LABEL}\"; token_resp=\$(curl ${CURL_WAN_ARG} -sk \"\$u/api/open/v1/token\" -H 'Content-Type: application/json' -d \"{\\\"access_key_id\\\":\\\"\$(sed -n 's/^app_id: //p' /opt/feilian/cpe/conf/config.yaml)\\\",\\\"access_key_secret\\\":\\\"\$(sed -n 's/^app_secret: //p' /opt/feilian/cpe/conf/config.yaml)\\\"}\" 2>&1); token=\$(echo \"\$token_resp\" | sed -n 's/.*\"access_token\":\"\\([^\"]*\\)\".*/\\1/p'); ep=\$(awk -F \"'\" '/option dns_controller_grpc_addr/ {print \$2; exit}' /opt/feilian/cpe/.cache/ucistore | tr : ' '); host=\$(echo \"\$ep\" | awk '{print \$1}'); port=\$(echo \"\$ep\" | awk '{print \$2}'); echo \"token接口返回: \$token_resp\"; echo \"连接中心DNS GRPC地址: \$host:\$port\"; if [ -n \"\$token\" ] && [ -n \"\$host\" ] && [ -n \"\$port\" ]; then curl ${CURL_WAN_ARG} -kv \"https://\$host:\$port\" -X POST -H \"Authorization: Bearer \$token\" -H 'content-type: application/grpc+proto' 2>&1; else echo '获取access_token或DNS GRPC地址失败'; fi"
+        CENTER_DNS_GRPC_CMD="u=\$(sed -n 's/^url: //p' /opt/feilian/cpe/conf/config.yaml); printf '%s\n' \"curl出接口: ${CURL_WAN_LABEL}\"; cred_resp=\$(curl ${CURL_WAN_ARG} -sk \"\$u/api/open/v1/token\" -H 'Content-Type: application/json' -d \"{\\\"access_key_id\\\":\\\"\$(sed -n 's/^app_id: //p' /opt/feilian/cpe/conf/config.yaml)\\\",\\\"access_key_secret\\\":\\\"\$(sed -n 's/^app_secret: //p' /opt/feilian/cpe/conf/config.yaml)\\\"}\" 2>&1); cred=\$(echo \"\$cred_resp\" | sed -n 's/.*\"access_token\":\"\\([^\"]*\\)\".*/\\1/p'); ep=\$(awk -F \"'\" '/option dns_controller_grpc_addr/ {print \$2; exit}' /opt/feilian/cpe/.cache/ucistore | tr : ' '); host=\$(echo \"\$ep\" | awk '{print \$1}'); port=\$(echo \"\$ep\" | awk '{print \$2}'); [ -n \"\$cred\" ] && echo '认证接口返回: 已获取访问凭据' || echo '认证接口返回: 未获取访问凭据'; echo \"连接中心DNS GRPC地址: \$host:\$port\"; if [ -n \"\$cred\" ] && [ -n \"\$host\" ] && [ -n \"\$port\" ]; then curl ${CURL_WAN_ARG} -sk -o /dev/null -w 'HTTP状态: %{http_code}\n' \"https://\$host:\$port\" -X POST -H \"Authorization: Bearer \$cred\" -H 'content-type: application/grpc+proto' 2>&1; else echo '获取访问凭据或DNS GRPC地址失败'; fi"
         CENTER_DNS_GRPC_OUTPUT=$(eval "$CENTER_DNS_GRPC_CMD" 2>&1 || true)
-        CENTER_DNS_GRPC_HTTP_STATUS=$(echo "$CENTER_DNS_GRPC_OUTPUT" | awk '/< HTTP\// {print $3; exit}')
-        if echo "$CENTER_DNS_GRPC_OUTPUT" | grep -q '"access_token":"' && [[ "$CENTER_DNS_GRPC_HTTP_STATUS" == "200" ]]; then
-            CENTER_DNS_GRPC_EXTRA="${GREEN}◆ 判断原因: access_token获取成功，连接中心DNS GRPC ${CENTER_DNS_GRPC_HOST:-N/A}:${CENTER_DNS_GRPC_PORT:-N/A} 返回HTTP 200，连接成功${NC}"
+        CENTER_DNS_GRPC_HTTP_STATUS=$(echo "$CENTER_DNS_GRPC_OUTPUT" | awk -F: '/^HTTP状态:/ {gsub(/^[[:space:]]+/, "", $2); print $2; exit}')
+        if echo "$CENTER_DNS_GRPC_OUTPUT" | grep -q '已获取访问凭据' && [[ "$CENTER_DNS_GRPC_HTTP_STATUS" == "200" ]]; then
+            CENTER_DNS_GRPC_EXTRA="${GREEN}◆ 判断原因: 访问凭据获取成功，连接中心DNS GRPC ${CENTER_DNS_GRPC_HOST:-N/A}:${CENTER_DNS_GRPC_PORT:-N/A} 返回HTTP 200，连接成功${NC}"
             CENTER_DNS_GRPC_CODE=0
         else
-            CENTER_DNS_GRPC_EXTRA="${RED}◆ 判断原因: access_token获取或连接中心DNS GRPC连接异常，HTTP状态=${CENTER_DNS_GRPC_HTTP_STATUS:-N/A}，GRPC地址=${CENTER_DNS_GRPC_HOST:-N/A}:${CENTER_DNS_GRPC_PORT:-N/A}${NC}"
+            CENTER_DNS_GRPC_EXTRA="${RED}◆ 判断原因: 访问凭据获取或连接中心DNS GRPC连接异常，HTTP状态=${CENTER_DNS_GRPC_HTTP_STATUS:-N/A}，GRPC地址=${CENTER_DNS_GRPC_HOST:-N/A}:${CENTER_DNS_GRPC_PORT:-N/A}${NC}"
             CENTER_DNS_GRPC_CODE=1
         fi
 
         print_check "连接中心DNS GRPC" \
             "$CENTER_DNS_GRPC_CMD" \
-            "应能获取access_token，并使用Bearer token连接中心DNS GRPC返回HTTP 200" \
-            "请检查AK/SK、dns_controller_grpc_addr配置、DNS解析、49920端口和连接中心DNS GRPC服务状态" \
+            "应能获取访问凭据，并使用Bearer认证信息连接中心DNS GRPC返回HTTP 200" \
+            "请检查认证凭据、dns_controller_grpc_addr配置、DNS解析、49920端口和连接中心DNS GRPC服务状态" \
             "$CENTER_DNS_GRPC_EXTRA" \
             "$CENTER_DNS_GRPC_CODE" \
             "$CENTER_DNS_GRPC_OUTPUT"
@@ -3490,16 +3506,16 @@ check_center_dns_grpc() {
 check_center_dns_udp() {
     # 官方健康检查已确认中心DNS UDP端口探测成功时，跳过单独探测，避免重复巡检。
     if should_show_detail_check "${CPE_HEALTH_CENTER_DNS_UDP_OK:-false}"; then
-        # 中心 DNS UDP端口探测（AK/SK token + UDP 443 DNS探测）
-        CENTER_DNS_UDP_CMD="token_json=\$(awk -F \"'\" '/option token/ {print \$2; exit}' /opt/feilian/cpe/.cache/ucistore 2>/dev/null); if command -v jq >/dev/null 2>&1; then token=\$(echo \"\$token_json\" | jq -r .access_token 2>/dev/null); else token=\$(echo \"\$token_json\" | sed -n 's/.*\"access_token\":\"\\([^\"]*\\)\".*/\\1/p'); fi; token_len=\$(echo \"\$token\" | wc -c); [ \"\$token_len\" -eq 41 ] && echo 'AK/SK 验证成功' || echo 'AK/SK 验证失败'; dns_ip=\$(awk -F '=' '/add-dns-server-ip/ {print \$2; exit}' /etc/dnsmasq.d/cpe.conf 2>/dev/null); echo \"中心 DNS: \${dns_ip:-未配置}\"; if [ -n \"\$dns_ip\" ]; then dev=\$(ip route get \"\$dns_ip\" 2>/dev/null | awk '{for(i=1;i<=NF;i++){if(\$i==\"dev\" && (i+1)<=NF){print \$(i+1); exit}}}'); echo \"出接口: \${dev:-未获取}\"; else echo '出接口: 未获取'; fi; if [ -n \"\$dns_ip\" ] && command -v dig >/dev/null 2>&1; then dig @\"\$dns_ip\" apple.com +timeout=1 +retry=2 -p 443 >/dev/null 2>&1 && echo '中心 DNS UDP端口探测成功' || echo '中心 DNS UDP端口探测失败'; elif ! command -v dig >/dev/null 2>&1; then echo '中心 DNS UDP端口探测失败: dig命令不存在'; else echo '中心 DNS UDP端口探测失败: 未获取到中心DNS地址'; fi"
+        # 中心 DNS UDP端口探测（认证凭据 + UDP 443 DNS探测）
+        CENTER_DNS_UDP_CMD="cred_json=\$(awk -F \"'\" '/option token/ {print \$2; exit}' /opt/feilian/cpe/.cache/ucistore 2>/dev/null); if command -v jq >/dev/null 2>&1; then cred=\$(echo \"\$cred_json\" | jq -r .access_token 2>/dev/null); else cred=\$(echo \"\$cred_json\" | sed -n 's/.*\"access_token\":\"\\([^\"]*\\)\".*/\\1/p'); fi; cred_len=\$(echo \"\$cred\" | wc -c); [ \"\$cred_len\" -eq 41 ] && echo '认证凭据 验证成功' || echo '认证凭据 验证失败'; dns_ip=\$(awk -F '=' '/add-dns-server-ip/ {print \$2; exit}' /etc/dnsmasq.d/cpe.conf 2>/dev/null); echo \"中心 DNS: \${dns_ip:-未配置}\"; if [ -n \"\$dns_ip\" ]; then dev=\$(ip route get \"\$dns_ip\" 2>/dev/null | awk '{for(i=1;i<=NF;i++){if(\$i==\"dev\" && (i+1)<=NF){print \$(i+1); exit}}}'); echo \"出接口: \${dev:-未获取}\"; else echo '出接口: 未获取'; fi; if [ -n \"\$dns_ip\" ] && command -v dig >/dev/null 2>&1; then dig @\"\$dns_ip\" apple.com +timeout=1 +retry=2 -p 443 >/dev/null 2>&1 && echo '中心 DNS UDP端口探测成功' || echo '中心 DNS UDP端口探测失败'; elif ! command -v dig >/dev/null 2>&1; then echo '中心 DNS UDP端口探测失败: dig命令不存在'; else echo '中心 DNS UDP端口探测失败: 未获取到中心DNS地址'; fi"
         CENTER_DNS_UDP_OUTPUT=$(eval "$CENTER_DNS_UDP_CMD" 2>&1 || true)
         CENTER_DNS_UDP_IP=$(awk -F '=' '/add-dns-server-ip/ {print $2; exit}' /etc/dnsmasq.d/cpe.conf 2>/dev/null)
         CENTER_DNS_UDP_ISSUES=()
-        echo "$CENTER_DNS_UDP_OUTPUT" | grep -q 'AK/SK 验证成功' || CENTER_DNS_UDP_ISSUES+=("AK/SK token校验失败")
+        echo "$CENTER_DNS_UDP_OUTPUT" | grep -q '认证凭据 验证成功' || CENTER_DNS_UDP_ISSUES+=("认证凭据校验失败")
         [[ -n "$CENTER_DNS_UDP_IP" ]] || CENTER_DNS_UDP_ISSUES+=("未获取到中心DNS地址")
         echo "$CENTER_DNS_UDP_OUTPUT" | grep -q '中心 DNS UDP端口探测成功' || CENTER_DNS_UDP_ISSUES+=("中心DNS UDP 443探测失败")
         if [[ "${#CENTER_DNS_UDP_ISSUES[@]}" -eq 0 ]]; then
-            CENTER_DNS_UDP_EXTRA="${GREEN}◆ 判断原因: AK/SK验证成功，中心DNS ${CENTER_DNS_UDP_IP}:443 UDP探测成功${NC}"
+            CENTER_DNS_UDP_EXTRA="${GREEN}◆ 判断原因: 认证凭据验证成功，中心DNS ${CENTER_DNS_UDP_IP}:443 UDP探测成功${NC}"
             CENTER_DNS_UDP_CODE=0
         else
             CENTER_DNS_UDP_EXTRA="${RED}◆ 判断原因: $(IFS='，'; echo "${CENTER_DNS_UDP_ISSUES[*]}")${NC}"
@@ -3508,8 +3524,8 @@ check_center_dns_udp() {
 
         print_check "中心 DNS UDP端口探测" \
             "$CENTER_DNS_UDP_CMD" \
-            "AK/SK token应有效，中心DNS UDP 443端口应可完成DNS解析探测" \
-            "请检查AK/SK token、/etc/dnsmasq.d/cpe.conf中的add-dns-server-ip、UDP 443出站策略和中心DNS服务状态" \
+            "认证凭据应有效，中心DNS UDP 443端口应可完成DNS解析探测" \
+            "请检查认证凭据、/etc/dnsmasq.d/cpe.conf中的add-dns-server-ip、UDP 443出站策略和中心DNS服务状态" \
             "$CENTER_DNS_UDP_EXTRA" \
             "$CENTER_DNS_UDP_CODE" \
             "$CENTER_DNS_UDP_OUTPUT"
@@ -4190,7 +4206,7 @@ find_domain_schedule_rule_matches() {
 }
 
 extract_domain_schedule_dns_from_rules() {
-    # 从 server=/example.com/1.2.3.4#443 中提取上游 DNS IP，用于和 dnsmasq forwarded 日志比对。
+    # 从 server=/example.com/192.0.2.53#443 中提取上游 DNS IP，用于和 dnsmasq forwarded 日志比对。
     awk -F/ '
         NF >= 3 {
             upstream = $3
@@ -4340,12 +4356,12 @@ run_ip_publish_checks() {
     prompt_ip_publish_target
     target_ip="$IP_PUBLISH_TARGET_IP"
     if ! validate_ipv4 "$target_ip"; then
-        echo -e "${RED}参数错误: 请通过 --target-ip 指定有效目标IP，例如: $0 --mode ip --target-ip 200.1.1.1${NC}" >&2
+        echo -e "${RED}参数错误: 请通过 --target-ip 指定有效目标IP，例如: $0 --mode ip --target-ip 203.0.113.10${NC}" >&2
         return 127
     fi
 
     print_mode_banner "飞连CPE IP调度不生效排查" "目标IP" "$target_ip" "$iface"
-    run_native_cpe_health_check_step "IP调度-步骤1 原生CPE健康检查" "IP调度" "请先根据/opt/feilian/cpe/bin/feilian-cpe-health-check 的非成功项修复网络、DNS、GRPC、AK/SK或隧道连通性，再继续IP调度排查" || true
+    run_native_cpe_health_check_step "IP调度-步骤1 原生CPE健康检查" "IP调度" "请先根据/opt/feilian/cpe/bin/feilian-cpe-health-check 的非成功项修复网络、DNS、GRPC、认证凭据或隧道连通性，再继续IP调度排查" || true
 
     cmd="echo '=== 目标IP路由详情 ==='; ip route get ${target_ip}; echo; echo '=== 策略路由规则 ==='; ip rule"
     output=$(eval "$cmd" 2>&1 || true)
@@ -4750,7 +4766,7 @@ show_help() {
 选项:
     -h, --help          显示帮助信息
     --mode MODE         指定执行场景: cpe|ip|domain|optimize
-    --target-ip IP      IP发布/调度排查目标IP，例如 200.1.1.1
+    --target-ip IP      IP发布/调度排查目标IP，例如 203.0.113.10
     --domain DOMAIN     域名调度排查目标域名，例如 www.aliyun.com
     --iface IFACE       IP发布/调度排查接口，默认 tun0_master
     -j, --json          以JSON格式输出结果
@@ -4762,7 +4778,7 @@ show_help() {
 示例:
     $0                          # 标准终端输出
     $0 --mode cpe              # 直接执行CPE巡检，不进入交互菜单
-    $0 --mode ip --target-ip 200.1.1.1
+    $0 --mode ip --target-ip 203.0.113.10
                                 # 执行CPE IP调度不生效排查
     $0 --mode domain --domain www.aliyun.com
                                 # 执行CPE域名调度异常排查

@@ -99,13 +99,13 @@ sudo ./scripts/feilian-cpe-health-check-pro.sh --mode cpe
 ### 4.3 排查 IP 调度
 
 ```bash
-sudo ./scripts/feilian-cpe-health-check-pro.sh --mode ip --target-ip 200.1.1.1
+sudo ./scripts/feilian-cpe-health-check-pro.sh --mode ip --target-ip 203.0.113.10
 ```
 
 指定检查接口，默认是 `tun0_master`：
 
 ```bash
-sudo ./scripts/feilian-cpe-health-check-pro.sh --mode ip --target-ip 200.1.1.1 --iface tun0_master
+sudo ./scripts/feilian-cpe-health-check-pro.sh --mode ip --target-ip 203.0.113.10 --iface tun0_master
 ```
 
 ### 4.4 排查域名调度
@@ -144,10 +144,10 @@ sudo ./scripts/feilian-cpe-health-check-pro.sh --mode cpe -j -o /tmp/feilian-cpe
 |---|---|---|
 | `-h` 或 `--help` | 查看帮助信息 | `./scripts/feilian-cpe-health-check-pro.sh --help` |
 | `--mode cpe` | 直接执行 CPE 全面巡检 | `--mode cpe` |
-| `--mode ip` | 直接执行 IP 调度排查 | `--mode ip --target-ip 200.1.1.1` |
+| `--mode ip` | 直接执行 IP 调度排查 | `--mode ip --target-ip 203.0.113.10` |
 | `--mode domain` | 直接执行域名调度排查 | `--mode domain --domain www.aliyun.com` |
 | `--mode optimize` | 进入常见优化脚本菜单 | `--mode optimize` |
-| `--target-ip IP` | IP 调度排查目标 IP | `--target-ip 200.1.1.1` |
+| `--target-ip IP` | IP 调度排查目标 IP | `--target-ip 203.0.113.10` |
 | `--domain DOMAIN` | 域名调度排查目标域名 | `--domain www.aliyun.com` |
 | `--iface IFACE` | IP 调度排查接口，默认 `tun0_master` | `--iface tun0_master` |
 | `-f` 或 `--full` | 展示全部巡检项，不跳过重复项 | `-f` |
@@ -191,13 +191,13 @@ sudo ./scripts/feilian-cpe-health-check-pro.sh --mode cpe -j -o /tmp/feilian-cpe
 脚本会自动去掉 IP 前后的空格。例如：
 
 ```text
-200.1.1.1 
+203.0.113.10<尾随空格>
 ```
 
 会被识别为：
 
 ```text
-200.1.1.1
+203.0.113.10
 ```
 
 ## 7. 输出结果怎么看
@@ -250,7 +250,7 @@ sudo ./scripts/feilian-cpe-health-check-pro.sh --mode cpe
 执行方式：
 
 ```bash
-sudo ./scripts/feilian-cpe-health-check-pro.sh --mode ip --target-ip 200.1.1.1
+sudo ./scripts/feilian-cpe-health-check-pro.sh --mode ip --target-ip 203.0.113.10
 ```
 
 ### 8.3 选项 3：CPE 域名调度检查
@@ -483,7 +483,7 @@ sudo ./scripts/feilian-cpe-health-check-pro.sh --mode optimize
 
 检查内容：
 
-- 获取 access_token。
+- 获取 访问凭据。
 - 连接管理后台 GRPC 地址。
 
 作用：判断 CPE 和管理后台 GRPC 通道是否正常。
@@ -492,7 +492,7 @@ sudo ./scripts/feilian-cpe-health-check-pro.sh --mode optimize
 
 检查内容：
 
-- 获取 access_token。
+- 获取 访问凭据。
 - 连接中心 DNS GRPC 地址。
 
 作用：判断 CPE 到中心 DNS 控制面的 GRPC 通道是否正常。
@@ -575,7 +575,7 @@ IP 调度排查用于确认目标 IP 是否按预期进入飞连隧道，并命�
 命令行模式：
 
 ```bash
-sudo ./scripts/feilian-cpe-health-check-pro.sh --mode ip --target-ip 200.1.1.1
+sudo ./scripts/feilian-cpe-health-check-pro.sh --mode ip --target-ip 203.0.113.10
 ```
 
 ### 10.2 步骤 2：路由走向校验
@@ -834,7 +834,7 @@ ip route flush cache
 
 输入内容：
 
-- 透明代理目标 IP，例如 `30.100.1.1`。
+- 透明代理目标 IP，例如 `198.51.100.10`。
 - 透明代理目标端口，例如 `23`。
 - 多个端口用英文逗号分隔，例如 `995,587`。
 
@@ -843,15 +843,15 @@ ip route flush cache
 示例：
 
 ```text
-请输入透明代理目标IP: 30.100.1.1
+请输入透明代理目标IP: 198.51.100.10
 请输入透明代理目标端口，多个用逗号分隔: 23,443
 ```
 
 脚本可能生成：
 
 ```text
-30.100.1.1:23 -> 127.0.0.1:20000
-30.100.1.1:443 -> 127.0.0.1:20001
+198.51.100.10:23 -> 127.0.0.1:20000
+198.51.100.10:443 -> 127.0.0.1:20001
 ```
 
 端口分配规则：
@@ -983,7 +983,7 @@ iptables `REDIRECT` 只负责把流量转到本机端口，Nginx stream 负责�
 
 ### 15.9 域名调度中 forwarded DNS 是什么？
 
-`forwarded www.example.com to 180.184.33.35` 表示 dnsmasq 实际把域名请求转发给了 `180.184.33.35`。脚本会把它和 `gfw_domain.conf` 中配置的 DNS 对比。
+`forwarded www.example.com to 192.0.2.53` 表示 dnsmasq 实际把域名请求转发给了 `192.0.2.53`。脚本会把它和 `gfw_domain.conf` 中配置的 DNS 对比。
 
 ### 15.10 traceroute 第二跳为什么重要？
 
@@ -1020,7 +1020,7 @@ sudo ./scripts/feilian-cpe-health-check-pro.sh --mode cpe -f -o /tmp/cpe-full-re
 命令：
 
 ```bash
-sudo ./scripts/feilian-cpe-health-check-pro.sh --mode ip --target-ip 200.1.1.1
+sudo ./scripts/feilian-cpe-health-check-pro.sh --mode ip --target-ip 203.0.113.10
 ```
 
 ### 16.3 域名调度不生效
@@ -1047,7 +1047,7 @@ sudo ./scripts/feilian-cpe-health-check-pro.sh --mode domain --domain www.aliyun
 - 执行优化脚本前建议保留当前巡检报告。
 - 修改 POP、路由、iptables、Nginx 可能造成短暂业务中断。
 - TCP 透明代理只适合明确目标 IP 和 TCP 端口的场景。
-- 不建议把设备敏感日志、AK/SK、token 输出上传到公开工单或公开仓库。
+- 不建议把设备敏感日志、认证凭据和认证返回输出上传到公开工单或公开仓库。
 
 ## 18. 仓库文件说明
 
